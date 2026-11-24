@@ -8,6 +8,7 @@
 #ifndef _WIN32
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <arpa/inet.h> // ntohl (needed on Switch/libnx)
 #endif
 
 #include <curl/curl.h>

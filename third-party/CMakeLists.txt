@@ -55,8 +55,10 @@ if(NOT CHIAKI_USE_SYSTEM_JERASURE)
 	add_library(Jerasure::Jerasure ALIAS jerasure)
 endif()
 
-if (NOT CHIAKI_IS_SWITCH) 
-	if(NOT CHIAKI_USE_SYSTEM_CURL) 
+# Switch: devkitPro's switch-curl (7.69) lacks WebSocket support needed by
+# holepunch, so allow building the bundled curl there too.
+if (NOT CHIAKI_IS_SWITCH OR NOT CHIAKI_USE_SYSTEM_CURL)
+	if(NOT CHIAKI_USE_SYSTEM_CURL)
 		##################
 		# libcurl (with experimental WebSocket support enabled)
 		##################

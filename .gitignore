@@ -39,3 +39,6 @@ chiaki.conf
 .cache/
 *.vscode
 site/
+
+# Switch build: downloaded prebuilt packages
+/*.pkg.tar.zst
