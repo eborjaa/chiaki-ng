@@ -198,9 +198,22 @@ void HostInterface::ConnectSession()
 	brls::Application::blockInputs();
 
 	// connect host sesssion
-	this->host->InitSession(this->io);
-	CHIAKI_LOGI(this->log, "Session initiated");
-	this->host->StartSession();
+	CHIAKI_LOGI(this->log, "Connecting to %s (%s)",
+		this->host->GetHostName().c_str(), this->host->GetHostAddr().c_str());
+	try
+	{
+		this->host->InitSession(this->io);
+		CHIAKI_LOGI(this->log, "Session initiated");
+		this->host->StartSession();
+	}
+	catch(const std::exception &e)
+	{
+		// show the error instead of aborting the whole app
+		CHIAKI_LOGE(this->log, "Connect failed: %s", e.what());
+		this->host->FiniSession();
+		brls::Application::unblockInputs();
+		brls::Application::notify(std::string("Connect failed: ") + e.what());
+	}
 }
 
 void HostInterface::Disconnect()
@@ -241,6 +254,8 @@ void HostInterface::CloseStream(ChiakiQuitEvent *quit)
 	/*
 	  DIALOG(sqrs, chiaki_quit_reason_string(quit->reason));
 	*/
+	CHIAKI_LOGI(this->log, "Session quit: %s%s%s", chiaki_quit_reason_string(quit->reason),
+		quit->reason_str ? " - " : "", quit->reason_str ? quit->reason_str : "");
 	brls::Application::notify(chiaki_quit_reason_string(quit->reason));
 	Disconnect();
 }

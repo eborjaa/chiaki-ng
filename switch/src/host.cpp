@@ -221,7 +221,10 @@ void Host::StartSession()
 	ChiakiErrorCode err = chiaki_session_start(&this->session);
 	if(err != CHIAKI_ERR_SUCCESS)
 	{
+		CHIAKI_LOGE(this->log, "chiaki_session_start failed: %s", chiaki_error_string(err));
 		chiaki_session_fini(&this->session);
+		chiaki_opus_decoder_fini(&this->opus_decoder);
+		this->session_init = false;
 		throw Exception("Chiaki Session Start failed");
 	}
 }

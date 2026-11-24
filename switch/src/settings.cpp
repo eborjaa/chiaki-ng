@@ -4,10 +4,49 @@
 #include <chiaki/base64.h>
 #include "settings.h"
 
+#if defined(__SWITCH__)
+#include <cstdio>
+#include <ctime>
+#include <mutex>
+
+// Persist logs to the SD card so connection failures can be diagnosed
+// without nxlink. The previous run is kept as chiaki-ng.log.1.
+#define CHIAKI_LOG_FILE "sdmc:/switch/chiaki-ng/chiaki-ng.log"
+static FILE *log_file = nullptr;
+static std::mutex log_file_mutex;
+
+static void LogCbFile(ChiakiLogLevel level, const char *msg, void *user)
+{
+	chiaki_log_cb_print(level, msg, user);
+	std::lock_guard<std::mutex> lock(log_file_mutex);
+	if(!log_file)
+		return;
+	char c = '?';
+	switch(level)
+	{
+		case CHIAKI_LOG_DEBUG: c = 'D'; break;
+		case CHIAKI_LOG_VERBOSE: c = 'V'; break;
+		case CHIAKI_LOG_INFO: c = 'I'; break;
+		case CHIAKI_LOG_WARNING: c = 'W'; break;
+		case CHIAKI_LOG_ERROR: c = 'E'; break;
+	}
+	time_t now = time(nullptr);
+	struct tm tm_now;
+	localtime_r(&now, &tm_now);
+	char ts[32];
+	strftime(ts, sizeof(ts), "%H:%M:%S", &tm_now);
+	fprintf(log_file, "%s [%c] %s\n", ts, c, msg);
+	fflush(log_file);
+}
+#endif
+
 Settings::Settings()
 {
 #if defined(__SWITCH__)
-	chiaki_log_init(&this->log, CHIAKI_LOG_ALL & ~(CHIAKI_LOG_VERBOSE | CHIAKI_LOG_DEBUG), chiaki_log_cb_print, NULL);
+	remove(CHIAKI_LOG_FILE ".1");
+	rename(CHIAKI_LOG_FILE, CHIAKI_LOG_FILE ".1");
+	log_file = fopen(CHIAKI_LOG_FILE, "w");
+	chiaki_log_init(&this->log, CHIAKI_LOG_ALL & ~CHIAKI_LOG_VERBOSE, LogCbFile, NULL);
 #else
 	chiaki_log_init(&this->log, CHIAKI_LOG_ALL & ~CHIAKI_LOG_VERBOSE, chiaki_log_cb_print, NULL);
 #endif
