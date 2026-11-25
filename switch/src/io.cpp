@@ -3,7 +3,10 @@
 #include "io.h"
 #include "settings.h"
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <mutex>
 #include <thread>
 
 // https://github.com/torvalds/linux/blob/41ba50b0572e90ed3d24fe4def54567e9050bc47/drivers/hid/hid-sony.c#L2742
@@ -79,8 +82,58 @@ void main()
 }
 )glsl";
 
-int current_frame = 0;
+std::atomic<int> current_frame{0};
 int next_frame = 0;
+
+// Performance instrumentation: summarised in the log every STATS_INTERVAL_MS
+// so we can tell network loss apart from Switch-side slowness.
+#define STATS_INTERVAL_MS 5000
+static std::atomic<uint64_t> decoded_seq{0}; // bumps every decoded frame
+static uint64_t uploaded_seq = UINT64_MAX;    // last frame uploaded to GL (render thread)
+struct PerfStats
+{
+	std::mutex mtx;
+	uint64_t window_start_us = 0;
+	uint32_t packets = 0, decoded = 0, decode_fail = 0, frames_lost = 0, recovered = 0;
+	uint32_t draws = 0, uploads = 0;
+	uint64_t decode_us_sum = 0, decode_us_max = 0;
+	uint64_t transfer_us_sum = 0, transfer_us_max = 0;
+	uint64_t draw_us_sum = 0, draw_us_max = 0;
+};
+static PerfStats perf;
+
+static inline uint64_t NowUs()
+{
+	return std::chrono::duration_cast<std::chrono::microseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void PerfMaybeLog(ChiakiLog *log, uint64_t now)
+{
+	// caller holds perf.mtx
+	if(perf.window_start_us == 0)
+	{
+		perf.window_start_us = now;
+		return;
+	}
+	if(now - perf.window_start_us < STATS_INTERVAL_MS * 1000ULL)
+		return;
+	double secs = (now - perf.window_start_us) / 1e6;
+	CHIAKI_LOGI(log, "PERF %.1fs: pkts %.1f/s decoded %.1f/s shown %.1f/s draws %.1f/s | lost %u recovered %u decodefail %u | "
+		"decode avg %.2f max %.2f ms | hw->cpu copy avg %.2f max %.2f ms | draw avg %.2f max %.2f ms",
+		secs, perf.packets / secs, perf.decoded / secs, perf.uploads / secs, perf.draws / secs,
+		perf.frames_lost, perf.recovered, perf.decode_fail,
+		perf.decoded ? perf.decode_us_sum / 1000.0 / perf.decoded : 0.0, perf.decode_us_max / 1000.0,
+		perf.decoded ? perf.transfer_us_sum / 1000.0 / perf.decoded : 0.0, perf.transfer_us_max / 1000.0,
+		perf.draws ? perf.draw_us_sum / 1000.0 / perf.draws : 0.0, perf.draw_us_max / 1000.0);
+	uint64_t start = now;
+	perf.packets = perf.decoded = perf.decode_fail = perf.frames_lost = perf.recovered = 0;
+	perf.draws = perf.uploads = 0;
+	perf.decode_us_sum = perf.decode_us_max = 0;
+	perf.transfer_us_sum = perf.transfer_us_max = 0;
+	perf.draw_us_sum = perf.draw_us_max = 0;
+	perf.window_start_us = start;
+}
 
 bool haptic_lock = false;
 int haptic_val = 0;
@@ -208,6 +261,8 @@ void IO::DumpProgramError(GLuint prog, const char *func, const char *file, int l
 bool IO::VideoCB(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user)
 {
 	// callback function to decode video buffer
+	uint64_t t_start = NowUs();
+	uint64_t t_decoded = 0, t_end = 0;
 
 	AVPacket* packet = av_packet_alloc();
 	packet->data = buf;
@@ -244,6 +299,7 @@ send_packet:
 	// Pull
 	if (enableHWAccl) {
 		r = avcodec_receive_frame(this->codec_context, this->tmp_frame);
+		t_decoded = NowUs();
 		if (r == 0) {
 			if (av_hwframe_transfer_data(this->frames[next_frame], this->tmp_frame, 0) < 0) {
 				CHIAKI_LOGI(this->log, "transfer error");
@@ -254,6 +310,7 @@ send_packet:
 		}
 	} else {
 		r = avcodec_receive_frame(this->codec_context, this->frames[next_frame]);
+		t_decoded = NowUs();
 	}
 
 	if(r != 0) {
@@ -261,9 +318,32 @@ send_packet:
 	} else {
 		current_frame = next_frame;
 		next_frame = (next_frame + 1) % MAX_FRAME_COUNT;
+		decoded_seq++;
 	}
 
 	av_packet_free(&packet);
+
+	t_end = NowUs();
+	{
+		std::lock_guard<std::mutex> lock(perf.mtx);
+		perf.packets++;
+		if(frames_lost > 0)
+			perf.frames_lost += frames_lost;
+		if(frame_recovered)
+			perf.recovered++;
+		if(r == 0)
+		{
+			perf.decoded++;
+			uint64_t dec = t_decoded - t_start, xfer = t_end - t_decoded;
+			perf.decode_us_sum += dec;
+			perf.transfer_us_sum += xfer;
+			if(dec > perf.decode_us_max) perf.decode_us_max = dec;
+			if(xfer > perf.transfer_us_max) perf.transfer_us_max = xfer;
+		}
+		else
+			perf.decode_fail++;
+		PerfMaybeLog(this->log, t_end);
+	}
 	return true;
 }
 
@@ -1136,18 +1216,28 @@ inline void IO::SetOpenGlNV12Pixels(AVFrame *frame)
 	}
 
 	isFirst = false;
-	glFinish();
+	// no glFinish here: glTexSubImage2D consumes client memory on return,
+	// and OpenGlDraw already finishes once per frame
 }
 
 inline void IO::OpenGlDraw()
 {
+	uint64_t t_draw = NowUs();
 	glClear(GL_COLOR_BUFFER_BIT);
 
-	if (enableHWAccl) {
-		SetOpenGlNV12Pixels(this->frames[current_frame]);
-	} else {
-		// send to OpenGl
-		SetOpenGlYUVPixels(this->frames[current_frame]);
+	// only upload when a new frame was decoded since the last draw;
+	// re-uploading the same 1280x720 frame wastes CPU/memory bandwidth
+	uint64_t seq = decoded_seq.load();
+	bool upload = isFirst || seq != uploaded_seq;
+	if (upload) {
+		uploaded_seq = seq;
+		if (enableHWAccl) {
+			SetOpenGlNV12Pixels(this->frames[current_frame]);
+		} else {
+			// send to OpenGl
+			SetOpenGlYUVPixels(this->frames[current_frame]);
+		}
+		D(glUseProgram(this->prog));
 	}
 
 	//avcodec_flush_buffers(this->codec_context);
@@ -1162,6 +1252,15 @@ inline void IO::OpenGlDraw()
 	D(glDrawArrays(GL_TRIANGLE_STRIP, 0, 4));
 	D(glBindVertexArray(0));
 	D(glFinish());
+
+	uint64_t dt = NowUs() - t_draw;
+	std::lock_guard<std::mutex> lock(perf.mtx);
+	perf.draws++;
+	if(upload)
+		perf.uploads++;
+	perf.draw_us_sum += dt;
+	if(dt > perf.draw_us_max)
+		perf.draw_us_max = dt;
 }
 
 bool IO::InitController()
