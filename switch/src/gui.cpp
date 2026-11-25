@@ -2,6 +2,8 @@
 
 #include "gui.h"
 #include <chiaki/log.h>
+#include <chiaki/session.h>
+#include <chrono>
 #include "views/enter_pin_view.h"
 #include "views/ps_remote_play.h"
 
@@ -52,11 +54,159 @@ HostInterface::HostInterface(Host *host)
 	// allow host to update controller state
 	this->host->SetEventRumbleCallback(std::bind(&IO::SetRumble, this->io, std::placeholders::_1, std::placeholders::_2));
 	this->host->SetReadControllerCallback(std::bind(&IO::UpdateControllerState, this->io, std::placeholders::_1, std::placeholders::_2));
+
+	this->tick_task = new HostTickTask(this);
+	this->tick_task->start();
 }
 
 HostInterface::~HostInterface()
 {
+	if(this->tick_task)
+	{
+		this->tick_task->stop();
+		this->tick_task = nullptr; // owned and freed by borealis' task manager
+	}
 	Disconnect();
+}
+
+void HostTickTask::run(retro_time_t currentTime)
+{
+	brls::RepeatingTask::run(currentTime);
+	this->host_interface->Tick();
+}
+
+static uint64_t NowMs()
+{
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static bool SwitchNetworkUp()
+{
+#ifdef __SWITCH__
+	bool up = false;
+	if(R_SUCCEEDED(nifmInitialize(NifmServiceType_User)))
+	{
+		NifmInternetConnectionType type;
+		u32 strength = 0;
+		NifmInternetConnectionStatus status;
+		if(R_SUCCEEDED(nifmGetInternetConnectionStatus(&type, &strength, &status)))
+			up = status == NifmInternetConnectionStatus_Connected;
+		nifmExit();
+	}
+	return up;
+#else
+	return true;
+#endif
+}
+
+void HostInterface::Tick()
+{
+	// UI thread: tear down a finished session and drive auto-reconnect
+	if(this->pending_close.exchange(false))
+		HandleSessionClosed();
+
+	if(this->reconnect_state == ReconnectState::Idle)
+		return;
+
+	uint64_t now = NowMs();
+	if(now < this->reconnect_next_ms)
+		return;
+
+	switch(this->reconnect_state)
+	{
+		case ReconnectState::WaitNetwork:
+			if(!SwitchNetworkUp())
+			{
+				if(now > this->reconnect_deadline_ms)
+				{
+					CHIAKI_LOGW(this->log, "Auto-reconnect: network did not come back, giving up");
+					brls::Application::notify("Reconnect cancelled: no network");
+					CancelReconnect();
+				}
+				else
+					this->reconnect_next_ms = now + 1000;
+				break;
+			}
+			CHIAKI_LOGI(this->log, "Auto-reconnect attempt %d/%d: network up, waking PlayStation",
+				this->reconnect_attempt, RECONNECT_MAX_ATTEMPTS);
+			if(this->host->HasRPkey())
+				this->host->Wakeup(); // harmless if the console is already awake
+			this->reconnect_state = ReconnectState::WaitWake;
+			// first attempt right away in case it never slept, later ones give it time to boot
+			this->reconnect_next_ms = now + (this->reconnect_attempt == 1 ? 1500 : RECONNECT_WAKE_DELAY_MS);
+			break;
+
+		case ReconnectState::WaitWake:
+			this->reconnect_state = ReconnectState::Idle; // ConnectSession / quit handling decide what's next
+			CHIAKI_LOGI(this->log, "Auto-reconnect attempt %d/%d: connecting",
+				this->reconnect_attempt, RECONNECT_MAX_ATTEMPTS);
+			brls::Application::notify(fmt::format("Reconnecting... ({}/{})",
+				this->reconnect_attempt, RECONNECT_MAX_ATTEMPTS));
+			if(!ConnectSession())
+				ScheduleReconnect("connect failed");
+			break;
+
+		default:
+			break;
+	}
+}
+
+void HostInterface::HandleSessionClosed()
+{
+	bool was_streaming = this->connected;
+	ChiakiQuitReason reason = (ChiakiQuitReason)this->pending_reason.load();
+
+	brls::Application::unblockInputs();
+	brls::Application::setMaximumFPS(60);
+	Disconnect();
+
+	// reconnect when a running stream dropped (e.g. Switch sleep / Wi-Fi loss),
+	// or while we are already in a reconnect cycle; not when the PS5 shut down
+	// a stream that was actually playing starts a fresh reconnect cycle
+	if(was_streaming)
+		CancelReconnect();
+	bool wanted = (was_streaming || this->reconnect_active)
+		&& reason != CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_SHUTDOWN
+		&& reason != CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_IN_USE;
+	if(wanted)
+		ScheduleReconnect(chiaki_quit_reason_string(reason));
+	else
+	{
+		CancelReconnect();
+		brls::Application::notify(chiaki_quit_reason_string(reason));
+	}
+}
+
+void HostInterface::ScheduleReconnect(const char *why)
+{
+	if(!this->reconnect_active)
+	{
+		this->reconnect_active = true;
+		this->reconnect_attempt = 0;
+		this->reconnect_deadline_ms = NowMs() + RECONNECT_NETWORK_TIMEOUT_MS;
+	}
+	if(this->reconnect_attempt >= RECONNECT_MAX_ATTEMPTS)
+	{
+		CHIAKI_LOGW(this->log, "Auto-reconnect: giving up after %d attempts (%s)", this->reconnect_attempt, why);
+		brls::Application::notify("Could not reconnect, press Connect to retry");
+		CancelReconnect();
+		return;
+	}
+	this->reconnect_attempt++;
+	CHIAKI_LOGI(this->log, "Auto-reconnect scheduled (attempt %d/%d) after: %s",
+		this->reconnect_attempt, RECONNECT_MAX_ATTEMPTS, why);
+	if(this->reconnect_attempt == 1)
+		brls::Application::notify("Connection lost, reconnecting...");
+	this->reconnect_state = ReconnectState::WaitNetwork;
+	this->reconnect_next_ms = NowMs() + 1000;
+}
+
+void HostInterface::CancelReconnect()
+{
+	this->reconnect_state = ReconnectState::Idle;
+	this->reconnect_active = false;
+	this->reconnect_attempt = 0;
 }
 
 void HostInterface::Register(Host *host, std::function<void()> success_cb)
@@ -163,6 +313,9 @@ void HostInterface::Wakeup(brls::View *view)
 
 void HostInterface::Connect(brls::View *view)
 {
+	// a manual connect replaces any auto-reconnect in progress
+	CancelReconnect();
+
 	// check that all requirements are met
 	if(!this->host->IsDiscovered() && !this->host->HasRPkey())
 	{
@@ -191,7 +344,7 @@ void HostInterface::Connect(brls::View *view)
 	}
 }
 
-void HostInterface::ConnectSession()
+bool HostInterface::ConnectSession()
 {
 	// ignore all user inputs (avoid double connect)
 	// user inputs are restored with the CloseStream
@@ -213,7 +366,9 @@ void HostInterface::ConnectSession()
 		this->host->FiniSession();
 		brls::Application::unblockInputs();
 		brls::Application::notify(std::string("Connect failed: ") + e.what());
+		return false;
 	}
+	return true;
 }
 
 void HostInterface::Disconnect()
@@ -244,20 +399,13 @@ void HostInterface::Stream()
 
 void HostInterface::CloseStream(ChiakiQuitEvent *quit)
 {
-	// session QUIT call back
-	brls::Application::unblockInputs();
-
-	// restore 60 fps limit
-	brls::Application::setMaximumFPS(60);
-
-	// brls::Application::setDisplayFramerate(false);
-	/*
-	  DIALOG(sqrs, chiaki_quit_reason_string(quit->reason));
-	*/
+	// session QUIT call back: runs on chiaki's session thread, so only record
+	// it here; Tick() (UI thread) joins/frees the session and may reconnect.
+	// (Calling Disconnect() here joined the session thread from itself.)
 	CHIAKI_LOGI(this->log, "Session quit: %s%s%s", chiaki_quit_reason_string(quit->reason),
 		quit->reason_str ? " - " : "", quit->reason_str ? quit->reason_str : "");
-	brls::Application::notify(chiaki_quit_reason_string(quit->reason));
-	Disconnect();
+	this->pending_reason = (int)quit->reason;
+	this->pending_close = true;
 }
 
 void HostInterface::EnterPin(bool isError) 
