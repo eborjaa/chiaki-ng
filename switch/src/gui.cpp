@@ -106,10 +106,12 @@ void HostInterface::Tick()
 	if(this->pending_close.exchange(false))
 		HandleSessionClosed();
 
+	uint64_t now = NowMs();
+	Watchdog(now);
+
 	if(this->reconnect_state == ReconnectState::Idle)
 		return;
 
-	uint64_t now = NowMs();
 	if(now < this->reconnect_next_ms)
 		return;
 
@@ -152,9 +154,39 @@ void HostInterface::Tick()
 	}
 }
 
+void HostInterface::Watchdog(uint64_t now)
+{
+	if(!this->connected || this->watchdog_stop_sent)
+		return;
+	if(this->watch_start_ms == 0)
+		this->watch_start_ms = now;
+
+	uint64_t last_video = IO::LastVideoMs();
+	if(last_video < this->watch_start_ms)
+		last_video = this->watch_start_ms; // grace period from stream start
+	bool stalled = now - last_video > STALL_TIMEOUT_MS;
+
+	bool net_down = false;
+	if(now - this->last_net_check_ms >= 1000)
+	{
+		this->last_net_check_ms = now;
+		net_down = !SwitchNetworkUp();
+	}
+
+	if(stalled || net_down)
+	{
+		CHIAKI_LOGW(this->log, "Watchdog: %s, stopping session so it can reconnect",
+			net_down ? "Switch network is down" : "no video for 5 s");
+		this->watchdog_stop_sent = true;
+		this->host->StopSession();
+	}
+}
+
 void HostInterface::HandleSessionClosed()
 {
 	bool was_streaming = this->connected;
+	this->watch_start_ms = 0;
+	this->watchdog_stop_sent = false;
 	ChiakiQuitReason reason = (ChiakiQuitReason)this->pending_reason.load();
 
 	brls::Application::unblockInputs();

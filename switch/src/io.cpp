@@ -89,6 +89,7 @@ int next_frame = 0;
 // so we can tell network loss apart from Switch-side slowness.
 #define STATS_INTERVAL_MS 5000
 static std::atomic<uint64_t> decoded_seq{0}; // bumps every decoded frame
+static std::atomic<uint64_t> last_video_ms{0}; // for the stall watchdog in gui.cpp
 static uint64_t uploaded_seq = UINT64_MAX;    // last frame uploaded to GL (render thread)
 struct PerfStats
 {
@@ -147,6 +148,11 @@ static const float vert_pos[] = {
 
 IO *IO::instance = nullptr;
 bool enableHWAccl = true;
+
+uint64_t IO::LastVideoMs()
+{
+	return last_video_ms.load();
+}
 
 IO *IO::GetInstance()
 {
@@ -324,6 +330,8 @@ send_packet:
 	av_packet_free(&packet);
 
 	t_end = NowUs();
+	if(r == 0)
+		last_video_ms = t_end / 1000;
 	{
 		std::lock_guard<std::mutex> lock(perf.mtx);
 		perf.packets++;

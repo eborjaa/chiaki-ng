@@ -113,6 +113,8 @@ class IO
 		IO(const IO&) = delete;
 		void operator=(const IO&) = delete;
 		static IO * GetInstance();
+		// steady-clock ms of the last decoded video frame (0 = none yet)
+		static uint64_t LastVideoMs();
 		int HapticBase = 400;
 
 		~IO();

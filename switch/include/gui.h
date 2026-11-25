@@ -59,6 +59,13 @@ class HostInterface : public brls::List
 		uint64_t reconnect_deadline_ms = 0;
 		uint64_t reconnect_next_ms = 0;
 		bool reconnect_active = false;
+		// stall watchdog: chiaki keeps a dead session alive after Wi-Fi loss,
+		// so stop it ourselves when video stops or the network is down
+		static const uint64_t STALL_TIMEOUT_MS = 5000;
+		uint64_t watch_start_ms = 0;
+		uint64_t last_net_check_ms = 0;
+		bool watchdog_stop_sent = false;
+		void Watchdog(uint64_t now);
 		void HandleSessionClosed();
 		void ScheduleReconnect(const char *why);
 		void CancelReconnect();
