@@ -18,6 +18,9 @@ static std::mutex log_file_mutex;
 static void LogCbFile(ChiakiLogLevel level, const char *msg, void *user)
 {
 	chiaki_log_cb_print(level, msg, user);
+	// debug lines (e.g. ~3/s "Audio Hard clipping") are too chatty for the SD card
+	if(level == CHIAKI_LOG_DEBUG)
+		return;
 	std::lock_guard<std::mutex> lock(log_file_mutex);
 	if(!log_file)
 		return;
@@ -36,7 +39,14 @@ static void LogCbFile(ChiakiLogLevel level, const char *msg, void *user)
 	char ts[32];
 	strftime(ts, sizeof(ts), "%H:%M:%S", &tm_now);
 	fprintf(log_file, "%s [%c] %s\n", ts, c, msg);
-	fflush(log_file);
+	// flushing every line means a synchronous SD write per log line; only
+	// flush right away for errors (so crashes keep them), otherwise once a second
+	static time_t last_flush = 0;
+	if(level == CHIAKI_LOG_ERROR || now != last_flush)
+	{
+		fflush(log_file);
+		last_flush = now;
+	}
 }
 #endif
 
