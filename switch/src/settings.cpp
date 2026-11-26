@@ -24,6 +24,30 @@ static void LogCbFile(ChiakiLogLevel level, const char *msg, void *user)
 	std::lock_guard<std::mutex> lock(log_file_mutex);
 	if(!log_file)
 		return;
+	time_t now = time(nullptr);
+
+	// A dead socket logs the same error every second forever; collapse repeats
+	// so the log stays readable (and the SD card stays quiet).
+	static std::string last_msg;
+	static time_t last_msg_time = 0;
+	static unsigned suppressed = 0;
+	if(msg == last_msg && now - last_msg_time < 60)
+	{
+		suppressed++;
+		return;
+	}
+	if(suppressed > 0)
+	{
+		struct tm tm_prev;
+		localtime_r(&last_msg_time, &tm_prev);
+		char ts_prev[32];
+		strftime(ts_prev, sizeof(ts_prev), "%H:%M:%S", &tm_prev);
+		fprintf(log_file, "%s [W] previous message repeated %u more times\n", ts_prev, suppressed);
+		suppressed = 0;
+	}
+	last_msg = msg;
+	last_msg_time = now;
+
 	char c = '?';
 	switch(level)
 	{
@@ -33,7 +57,6 @@ static void LogCbFile(ChiakiLogLevel level, const char *msg, void *user)
 		case CHIAKI_LOG_WARNING: c = 'W'; break;
 		case CHIAKI_LOG_ERROR: c = 'E'; break;
 	}
-	time_t now = time(nullptr);
 	struct tm tm_now;
 	localtime_r(&now, &tm_now);
 	char ts[32];

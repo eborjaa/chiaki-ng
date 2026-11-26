@@ -195,6 +195,20 @@ static void PerfMaybeLog(ChiakiLog *log, uint64_t now)
 	perf.window_start_us = start;
 }
 
+// start every session with fresh counters (the PERF window used to carry the
+// previous session's start time, printing absurd "1234.5s" windows)
+static void PerfReset()
+{
+	std::lock_guard<std::mutex> lock(perf.mtx);
+	perf.window_start_us = 0;
+	perf.packets = perf.decoded = perf.decode_fail = perf.frames_lost = perf.recovered = 0;
+	perf.draws = perf.uploads = 0;
+	perf.decode_us_sum = perf.decode_us_max = 0;
+	perf.transfer_us_sum = perf.transfer_us_max = 0;
+	perf.draw_us_sum = perf.draw_us_max = 0;
+	perf_dropped_frames = 0;
+}
+
 bool haptic_lock = false;
 int haptic_val = 0;
 std::chrono::system_clock::time_point haptic_lock_time;
@@ -515,6 +529,7 @@ bool IO::InitVideo(int video_width, int video_height, int screen_width, int scre
 	this->screen_height = screen_height;
 	this->frames = (AVFrame**)malloc(MAX_FRAME_COUNT * sizeof(AVFrame*));
 	this->ResetFrameQueue();
+	PerfReset();
 
 	for (int i = 0; i < MAX_FRAME_COUNT; i++) {
 			frames[i] = av_frame_alloc();

@@ -110,7 +110,8 @@ static bool SwitchNetworkUp()
 // the internet too when UDP 9302 (PS5) / 987 (PS4) is forwarded.
 enum class ProbeResult { Ready, Standby, NoAnswer, ResolveFail };
 
-static ProbeResult ProbeConsole(const std::string &addr, bool ps5, int timeout_ms, std::string *ip_out)
+static ProbeResult ProbeConsole(const std::string &addr, bool ps5, int timeout_ms, std::string *ip_out,
+	const std::atomic<bool> *cancel = nullptr)
 {
 	struct addrinfo hints = {};
 	hints.ai_family = AF_INET;
@@ -137,18 +138,31 @@ static ProbeResult ProbeConsole(const std::string &addr, bool ps5, int timeout_m
 		: "SRCH * HTTP/1.1\ndevice-discovery-protocol-version:00020020\n";
 	sendto(fd, req, strlen(req), 0, (struct sockaddr *)&sa, sizeof(sa));
 
+	// poll in slices so a Cancel press is noticed within ~100 ms instead of
+	// waiting out the whole timeout
 	ProbeResult result = ProbeResult::NoAnswer;
-	struct pollfd pfd = { fd, POLLIN, 0 };
-	if(poll(&pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN))
+	uint64_t deadline = NowMs() + (uint64_t)timeout_ms;
+	while(true)
 	{
-		char buf[512] = {0};
-		ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
-		if(n > 0)
+		if(cancel && cancel->load())
+			break;
+		uint64_t left = deadline > NowMs() ? deadline - NowMs() : 0;
+		if(left == 0)
+			break;
+		struct pollfd pfd = { fd, POLLIN, 0 };
+		int slice = left > 100 ? 100 : (int)left;
+		if(poll(&pfd, 1, slice) > 0 && (pfd.revents & POLLIN))
 		{
-			if(strstr(buf, " 200 "))
-				result = ProbeResult::Ready;
-			else if(strstr(buf, " 620 "))
-				result = ProbeResult::Standby;
+			char buf[512] = {0};
+			ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+			if(n > 0)
+			{
+				if(strstr(buf, " 200 "))
+					result = ProbeResult::Ready;
+				else if(strstr(buf, " 620 "))
+					result = ProbeResult::Standby;
+			}
+			break;
 		}
 	}
 	close(fd);
@@ -156,7 +170,8 @@ static ProbeResult ProbeConsole(const std::string &addr, bool ps5, int timeout_m
 }
 
 // fallback when UDP discovery is filtered: is the Remote Play TCP port open?
-static bool TcpPortOpen(const std::string &ip, int port, int timeout_ms)
+static bool TcpPortOpen(const std::string &ip, int port, int timeout_ms,
+	const std::atomic<bool> *cancel = nullptr)
 {
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
 	if(fd < 0)
@@ -171,13 +186,24 @@ static bool TcpPortOpen(const std::string &ip, int port, int timeout_ms)
 		ok = true;
 	else if(errno == EINPROGRESS)
 	{
-		struct pollfd pfd = { fd, POLLOUT, 0 };
-		if(poll(&pfd, 1, timeout_ms) > 0)
+		uint64_t deadline = NowMs() + (uint64_t)timeout_ms;
+		while(true)
 		{
-			int err = 0;
-			socklen_t len = sizeof(err);
-			getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
-			ok = err == 0;
+			if(cancel && cancel->load())
+				break;
+			uint64_t left = deadline > NowMs() ? deadline - NowMs() : 0;
+			if(left == 0)
+				break;
+			struct pollfd pfd = { fd, POLLOUT, 0 };
+			int slice = left > 100 ? 100 : (int)left;
+			if(poll(&pfd, 1, slice) > 0)
+			{
+				int err = 0;
+				socklen_t len = sizeof(err);
+				getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+				ok = err == 0;
+				break;
+			}
 		}
 	}
 	close(fd);
@@ -214,6 +240,8 @@ void HostInterface::Connect(brls::View *view)
 
 	this->conn_state = ConnState::Preparing;
 	this->cancel_requested = false;
+	this->retry_active = false;
+	this->retry_deadline_ms = 0;
 	this->prep_done = false;
 	this->prep_ok = false;
 	this->prep_error.clear();
@@ -227,8 +255,13 @@ void HostInterface::Connect(brls::View *view)
 	this->connecting_dialog->addButton("Cancel", [this](brls::View *v) {
 		CHIAKI_LOGI(this->log, "Connect cancelled by user");
 		this->cancel_requested = true;
+		this->retry_active = false;
+		this->retry_deadline_ms = 0;
 		if(this->conn_state == ConnState::Starting)
 			this->host->StopSession();
+		// close immediately; the worker and the session callbacks see the flag
+		// and unwind on their own, Tick() puts the state back to Idle
+		CloseConnectingDialog();
 	});
 	this->connecting_dialog->setCancelable(false);
 	this->connecting_dialog->open();
@@ -259,9 +292,9 @@ void HostInterface::PrepareWorker()
 
 	SetStatus(local ? "Looking for your PS5 on this network" : "Reaching " + addr);
 	std::string ip;
-	ProbeResult probe = ProbeConsole(addr, ps5, 1500, &ip);
+	ProbeResult probe = ProbeConsole(addr, ps5, 1500, &ip, &this->cancel_requested);
 	if(probe == ProbeResult::NoAnswer && !this->cancel_requested)
-		probe = ProbeConsole(addr, ps5, 2000, &ip);
+		probe = ProbeConsole(addr, ps5, 2000, &ip, &this->cancel_requested);
 	if(this->cancel_requested)
 		return fail("");
 	CHIAKI_LOGI(this->log, "Probe %s (%s): %s", addr.c_str(), ip.c_str(),
@@ -274,7 +307,7 @@ void HostInterface::PrepareWorker()
 	if(probe == ProbeResult::NoAnswer)
 	{
 		// UDP may be filtered while TCP still gets through; try the session port
-		if(!TcpPortOpen(ip, 9295, 3000))
+		if(!TcpPortOpen(ip, 9295, 3000, &this->cancel_requested))
 			return fail("Can't reach your PS5 at " + addr + ".\n"
 				"It may be fully turned off (not in rest mode), or this network blocks Remote Play.");
 		CHIAKI_LOGI(this->log, "Discovery unanswered but TCP 9295 is open, trying anyway");
@@ -293,7 +326,7 @@ void HostInterface::PrepareWorker()
 				this->host->Wakeup();
 				next_wake = NowMs() + 10000;
 			}
-			if(ProbeConsole(addr, ps5, 2000, nullptr) == ProbeResult::Ready)
+			if(ProbeConsole(addr, ps5, 2000, nullptr, &this->cancel_requested) == ProbeResult::Ready)
 			{
 				awake = true;
 				break;
@@ -307,7 +340,8 @@ void HostInterface::PrepareWorker()
 				"Features Available in Rest Mode > Enable Turning On PS5 from Network.");
 		// Remote Play refuses connections for a moment right after waking
 		SetStatus("PS5 is awake, starting Remote Play");
-		std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+		for(int i = 0; i < 6 && !this->cancel_requested; i++)
+			std::this_thread::sleep_for(std::chrono::milliseconds(500));
 	}
 
 	this->prep_ok = true;
@@ -363,6 +397,15 @@ void HostInterface::Tick()
 			+ text + std::string(this->status_dots, '.') + std::string(3 - this->status_dots, ' '));
 	}
 
+	// "already in use" retry: one session start every RETRY_DELAY_MS until the
+	// window closes, keeping the connecting dialog on screen
+	if(this->retry_active && this->conn_state == ConnState::Idle && now >= this->retry_at_ms)
+	{
+		this->retry_active = false;
+		CHIAKI_LOGI(this->log, "Retrying connection, the console should be free now");
+		StartSessionAfterPrep();
+	}
+
 	if(this->conn_state == ConnState::Preparing && this->prep_done)
 	{
 		if(this->prep_thread.joinable())
@@ -382,17 +425,30 @@ void HostInterface::Tick()
 			StartSessionAfterPrep();
 	}
 
-	if(this->pending_connected.exchange(false) && this->conn_state == ConnState::Starting)
+	if(this->pending_connected.exchange(false))
 	{
-		this->conn_state = ConnState::Streaming;
-		this->watch_start_ms = 0;
-		CloseConnectingDialog([this]() {
-			// https://github.com/natinusala/borealis/issues/59
-			// disable 60 fps limit
-			brls::Application::setMaximumFPS(0);
-			brls::Application::pushView(new PSRemotePlay(this->host));
-			this->stream_view_shown = true;
-		});
+		if(this->cancel_requested)
+		{
+			// the user cancelled while the session was coming up: do not push
+			// the stream view, just tear the attempt down
+			CHIAKI_LOGI(this->log, "Connected after cancel, stopping the session");
+			this->host->StopSession();
+			this->conn_state = ConnState::Idle;
+		}
+		else if(this->conn_state == ConnState::Starting)
+		{
+			this->conn_state = ConnState::Streaming;
+			this->retry_active = false;
+			this->retry_deadline_ms = 0;
+			this->watch_start_ms = 0;
+			CloseConnectingDialog([this]() {
+				// https://github.com/natinusala/borealis/issues/59
+				// disable 60 fps limit
+				brls::Application::setMaximumFPS(0);
+				brls::Application::pushView(new PSRemotePlay(this->host));
+				this->stream_view_shown = true;
+			});
+		}
 	}
 
 	if(this->pending_close.exchange(false))
@@ -465,6 +521,21 @@ std::string HostInterface::QuitReasonMessage(ChiakiQuitReason reason, bool was_s
 	}
 }
 
+bool HostInterface::RetryableQuit(ChiakiQuitReason reason)
+{
+	// the console keeps the old session for a moment after the link drops and
+	// then rejects the next request; waking it takes a moment too
+	switch(reason)
+	{
+		case CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_IN_USE:
+		case CHIAKI_QUIT_REASON_SESSION_REQUEST_CONNECTION_REFUSED:
+		case CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_CRASH:
+			return true;
+		default:
+			return false;
+	}
+}
+
 void HostInterface::HandleSessionClosed()
 {
 	ConnState state = this->conn_state;
@@ -488,8 +559,25 @@ void HostInterface::HandleSessionClosed()
 	}
 	else if(state == ConnState::Starting)
 	{
+		uint64_t now = NowMs();
+		bool retry = !cancelled && RetryableQuit(reason)
+			&& (this->retry_deadline_ms == 0 || now < this->retry_deadline_ms);
 		std::string msg = QuitReasonMessage(reason, false);
-		Disconnect([this, msg, cancelled]() {
+		Disconnect();
+		if(retry)
+		{
+			if(this->retry_deadline_ms == 0)
+				this->retry_deadline_ms = now + RETRY_WINDOW_MS;
+			this->retry_at_ms = now + RETRY_DELAY_MS;
+			this->retry_active = true;
+			SetStatus("Waiting for the PS5 to finish the previous session");
+			CHIAKI_LOGI(this->log, "Console busy, retrying in %llu s",
+				(unsigned long long)(RETRY_DELAY_MS / 1000));
+			return;
+		}
+		this->retry_active = false;
+		this->retry_deadline_ms = 0;
+		CloseConnectingDialog([this, msg, cancelled]() {
 			if(!cancelled)
 				ShowError("Couldn't connect", msg);
 		});

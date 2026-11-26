@@ -78,6 +78,15 @@ class HostInterface : public brls::List
 		// next Tick so the view stack is never changed twice in one tick
 		std::string pending_disconnect_msg;
 
+		// the PS5 keeps a dropped session for a few seconds, so an immediate
+		// reconnect is answered with "already in use"; retry instead of failing
+		bool retry_active = false;
+		uint64_t retry_at_ms = 0;
+		uint64_t retry_deadline_ms = 0;
+		static const uint64_t RETRY_DELAY_MS = 3000;
+		static const uint64_t RETRY_WINDOW_MS = 30000;
+		static bool RetryableQuit(ChiakiQuitReason reason);
+
 		// stall watchdog: chiaki keeps a dead session alive after Wi-Fi loss
 		static const uint64_t STALL_TIMEOUT_MS = 5000;
 		uint64_t watch_start_ms = 0;
