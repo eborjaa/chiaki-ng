@@ -75,6 +75,22 @@ class IO
 		AVCodecContext *codec_context;
 		AVFrame **frames;
 		uintptr_t origin_ptr[MAX_FRAME_COUNT][MAX_NV12_PLANE_COUNT];
+		// Frame queue. The decoder fills a buffer from free_frames and publishes
+		// it; the draw thread takes the newest published one and only recycles
+		// the buffer it was showing once a replacement exists. Without this the
+		// decoder could overwrite the frame being uploaded (torn / smeared
+		// picture) and bursts of frames were either dropped or shown twice.
+		std::mutex frame_mtx;
+		int free_frames[MAX_FRAME_COUNT] = {};
+		int free_count = 0;
+		int ready_frames[MAX_FRAME_COUNT] = {};
+		int ready_head = 0;
+		int ready_count = 0;
+		int display_frame = -1;
+		void ResetFrameQueue();
+		int AcquireFrame();   // decoder thread; -1 if no buffer is free
+		void PublishFrame(int idx); // decoder thread
+		int TakeNextFrame();  // draw thread; -1 when nothing new arrived
 		AVFrame *tmp_frame;
 		SDL_AudioDeviceID sdl_audio_device_id = 0;
 		SDL_Event sdl_event;

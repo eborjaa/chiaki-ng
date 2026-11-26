@@ -85,11 +85,69 @@ void main()
 std::atomic<int> current_frame{0};
 int next_frame = 0;
 
+// ---------------------------------------------------------------------------
+// Frame queue
+
+void IO::ResetFrameQueue()
+{
+	std::lock_guard<std::mutex> lock(this->frame_mtx);
+	for(int i = 0; i < MAX_FRAME_COUNT; i++)
+		this->free_frames[i] = i;
+	this->free_count = MAX_FRAME_COUNT;
+	this->ready_head = 0;
+	this->ready_count = 0;
+	this->display_frame = -1;
+}
+
+// Decoder thread: grab a buffer to decode into.
+int IO::AcquireFrame()
+{
+	std::lock_guard<std::mutex> lock(this->frame_mtx);
+	if(this->free_count == 0)
+	{
+		// the draw thread is stuck and every buffer is queued: drop the oldest
+		// queued frame rather than decoding into one that is being displayed
+		if(this->ready_count == 0)
+			return -1;
+		int dropped = this->ready_frames[this->ready_head];
+		this->ready_head = (this->ready_head + 1) % MAX_FRAME_COUNT;
+		this->ready_count--;
+		this->free_frames[this->free_count++] = dropped;
+	}
+	return this->free_frames[--this->free_count];
+}
+
+void IO::PublishFrame(int idx)
+{
+	std::lock_guard<std::mutex> lock(this->frame_mtx);
+	this->ready_frames[(this->ready_head + this->ready_count) % MAX_FRAME_COUNT] = idx;
+	this->ready_count++;
+}
+
+// Draw thread: newest frame waiting to be shown, or -1 if none. The buffer
+// previously on screen goes back to the free list only now, so the decoder can
+// never write into a frame that is still being uploaded.
+int IO::TakeNextFrame()
+{
+	std::lock_guard<std::mutex> lock(this->frame_mtx);
+	if(this->ready_count == 0)
+		return -1;
+	int idx = this->ready_frames[this->ready_head];
+	this->ready_head = (this->ready_head + 1) % MAX_FRAME_COUNT;
+	this->ready_count--;
+	if(this->display_frame >= 0)
+		this->free_frames[this->free_count++] = this->display_frame;
+	this->display_frame = idx;
+	return idx;
+}
+
+
 // Performance instrumentation: summarised in the log every STATS_INTERVAL_MS
 // so we can tell network loss apart from Switch-side slowness.
 #define STATS_INTERVAL_MS 5000
 static std::atomic<uint64_t> decoded_seq{0}; // bumps every decoded frame
 static std::atomic<uint64_t> last_video_ms{0}; // for the stall watchdog in gui.cpp
+static std::atomic<uint32_t> perf_dropped_frames{0}; // decoded but had no buffer
 static uint64_t uploaded_seq = UINT64_MAX;    // last frame uploaded to GL (render thread)
 struct PerfStats
 {
@@ -120,10 +178,11 @@ static void PerfMaybeLog(ChiakiLog *log, uint64_t now)
 	if(now - perf.window_start_us < STATS_INTERVAL_MS * 1000ULL)
 		return;
 	double secs = (now - perf.window_start_us) / 1e6;
-	CHIAKI_LOGI(log, "PERF %.1fs: pkts %.1f/s decoded %.1f/s shown %.1f/s draws %.1f/s | lost %u recovered %u decodefail %u | "
+	uint32_t dropped = perf_dropped_frames.exchange(0);
+	CHIAKI_LOGI(log, "PERF %.1fs: pkts %.1f/s decoded %.1f/s shown %.1f/s draws %.1f/s | lost %u recovered %u decodefail %u nodrop %u | "
 		"decode avg %.2f max %.2f ms | hw->cpu copy avg %.2f max %.2f ms | draw avg %.2f max %.2f ms",
 		secs, perf.packets / secs, perf.decoded / secs, perf.uploads / secs, perf.draws / secs,
-		perf.frames_lost, perf.recovered, perf.decode_fail,
+		perf.frames_lost, perf.recovered, perf.decode_fail, dropped,
 		perf.decoded ? perf.decode_us_sum / 1000.0 / perf.decoded : 0.0, perf.decode_us_max / 1000.0,
 		perf.decoded ? perf.transfer_us_sum / 1000.0 / perf.decoded : 0.0, perf.transfer_us_max / 1000.0,
 		perf.draws ? perf.draw_us_sum / 1000.0 / perf.draws : 0.0, perf.draw_us_max / 1000.0);
@@ -303,28 +362,42 @@ send_packet:
 	}
 
 	// Pull
+	int frame_idx = this->AcquireFrame();
+	bool have_buffer = frame_idx >= 0;
 	if (enableHWAccl) {
 		r = avcodec_receive_frame(this->codec_context, this->tmp_frame);
 		t_decoded = NowUs();
-		if (r == 0) {
-			if (av_hwframe_transfer_data(this->frames[next_frame], this->tmp_frame, 0) < 0) {
+		if (r == 0 && have_buffer) {
+			if (av_hwframe_transfer_data(this->frames[frame_idx], this->tmp_frame, 0) < 0) {
 				CHIAKI_LOGI(this->log, "transfer error");
 			}
-			if (av_frame_copy_props(this->frames[next_frame], this->tmp_frame) < 0) {
+			if (av_frame_copy_props(this->frames[frame_idx], this->tmp_frame) < 0) {
 				CHIAKI_LOGI(this->log, "copy error");
 			}
 		}
 	} else {
-		r = avcodec_receive_frame(this->codec_context, this->frames[next_frame]);
+		// with no free buffer decode into the scratch frame and drop it, so the
+		// decoder stays in sync instead of being fed nothing
+		r = avcodec_receive_frame(this->codec_context,
+			have_buffer ? this->frames[frame_idx] : this->tmp_frame);
 		t_decoded = NowUs();
 	}
 
 	if(r != 0) {
 		CHIAKI_LOGE(this->log, "Failed to pull frame");
-	} else {
-		current_frame = next_frame;
-		next_frame = (next_frame + 1) % MAX_FRAME_COUNT;
+		if(have_buffer)
+		{
+			// the buffer was never published, put it straight back
+			this->frame_mtx.lock();
+			this->free_frames[this->free_count++] = frame_idx;
+			this->frame_mtx.unlock();
+		}
+	} else if(have_buffer) {
+		this->PublishFrame(frame_idx);
 		decoded_seq++;
+	} else {
+		perf_dropped_frames++;
+		CHIAKI_LOGW(this->log, "No free frame buffer, dropped a frame");
 	}
 
 	av_packet_free(&packet);
@@ -441,6 +514,7 @@ bool IO::InitVideo(int video_width, int video_height, int screen_width, int scre
 	this->screen_width = screen_width;
 	this->screen_height = screen_height;
 	this->frames = (AVFrame**)malloc(MAX_FRAME_COUNT * sizeof(AVFrame*));
+	this->ResetFrameQueue();
 
 	for (int i = 0; i < MAX_FRAME_COUNT; i++) {
 			frames[i] = av_frame_alloc();
@@ -1233,17 +1307,18 @@ inline void IO::OpenGlDraw()
 	uint64_t t_draw = NowUs();
 	glClear(GL_COLOR_BUFFER_BIT);
 
-	// only upload when a new frame was decoded since the last draw;
-	// re-uploading the same 1280x720 frame wastes CPU/memory bandwidth
-	uint64_t seq = decoded_seq.load();
-	bool upload = isFirst || seq != uploaded_seq;
+	// take at most one new frame per refresh: bursts are shown one per vblank
+	// instead of being overwritten before they are ever visible
+	int frame_idx = this->TakeNextFrame();
+	bool upload = isFirst || frame_idx >= 0;
 	if (upload) {
-		uploaded_seq = seq;
+		int show = frame_idx >= 0 ? frame_idx : (this->display_frame >= 0 ? this->display_frame : 0);
+		uploaded_seq = decoded_seq.load();
 		if (enableHWAccl) {
-			SetOpenGlNV12Pixels(this->frames[current_frame]);
+			SetOpenGlNV12Pixels(this->frames[show]);
 		} else {
 			// send to OpenGl
-			SetOpenGlYUVPixels(this->frames[current_frame]);
+			SetOpenGlYUVPixels(this->frames[show]);
 		}
 		D(glUseProgram(this->prog));
 	}
