@@ -342,6 +342,13 @@ void HostInterface::Tick()
 	if(this->pending_register_connect.exchange(false))
 		Connect(nullptr);
 
+	if(!this->pending_disconnect_msg.empty())
+	{
+		std::string msg = this->pending_disconnect_msg;
+		this->pending_disconnect_msg.clear();
+		ShowDisconnected(msg);
+	}
+
 	// animate the connecting dialog
 	if(this->connecting_label && now - this->status_dots_ms >= 400)
 	{
@@ -469,22 +476,26 @@ void HostInterface::HandleSessionClosed()
 	this->conn_state = ConnState::Idle;
 
 	brls::Application::setMaximumFPS(60);
-	Disconnect(); // pops the stream view if it was shown, joins + frees the session
 
 	if(state == ConnState::Streaming)
 	{
 		std::string msg = !watchdog.empty() ? watchdog : QuitReasonMessage(reason, true);
 		CHIAKI_LOGI(this->log, "Disconnected: %s", msg.c_str());
-		ShowDisconnected(msg);
+		// the stream view is still on screen (and drawn during its fade-out),
+		// so the session is freed once borealis has deleted it, and the dialog
+		// is shown on the next tick
+		Disconnect([this, msg]() { this->pending_disconnect_msg = msg; });
 	}
 	else if(state == ConnState::Starting)
 	{
 		std::string msg = QuitReasonMessage(reason, false);
-		CloseConnectingDialog([this, msg, cancelled]() {
+		Disconnect([this, msg, cancelled]() {
 			if(!cancelled)
 				ShowError("Couldn't connect", msg);
 		});
 	}
+	else
+		Disconnect();
 }
 
 void HostInterface::CloseConnectingDialog(std::function<void(void)> then)
@@ -601,17 +612,28 @@ void HostInterface::Register()
 	HostInterface::Register(this->host, [this]() { this->pending_register_connect = true; });
 }
 
-void HostInterface::Disconnect()
+void HostInterface::Disconnect(std::function<void()> then)
 {
 	if(this->conn_state == ConnState::Streaming)
 		this->conn_state = ConnState::Idle;
-	// the stream view is the top view only while streaming
+	this->host->StopSession();
+	if(this->stream_view_shown && then)
+	{
+		this->stream_view_shown = false;
+		// popView() deletes the view when the fade ends; freeing the session
+		// before that leaves the view drawing freed video buffers
+		brls::Application::popView(brls::ViewAnimation::FADE, [this, then]() {
+			this->host->FiniSession();
+			then();
+		});
+		return;
+	}
 	if(this->stream_view_shown)
 	{
+		// teardown path (destructor): no continuation to capture
 		this->stream_view_shown = false;
 		brls::Application::popView();
 	}
-	this->host->StopSession();
 	this->host->FiniSession();
 }
 

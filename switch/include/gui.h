@@ -74,6 +74,9 @@ class HostInterface : public brls::List
 		std::atomic<bool> pending_close{false};
 		std::atomic<int> pending_reason{0};
 		std::atomic<bool> pending_register_connect{false};
+		// set once the stream view is really gone; the dialog is shown on the
+		// next Tick so the view stack is never changed twice in one tick
+		std::string pending_disconnect_msg;
 
 		// stall watchdog: chiaki keeps a dead session alive after Wi-Fi loss
 		static const uint64_t STALL_TIMEOUT_MS = 5000;
@@ -99,7 +102,11 @@ class HostInterface : public brls::List
 		static void Register(Host *host, std::function<void()> success_cb = nullptr);
 		void Register();
 		void Connect(brls::View *view);
-		void Disconnect();
+		// pops the stream view, frees the session and only then runs `then`:
+		// borealis animates (and deletes) the view asynchronously, so touching
+		// the session or pushing another view in the same tick frees a view that
+		// is still being drawn (crash on disconnect).
+		void Disconnect(std::function<void()> then = nullptr);
 		void Stream();
 		void EnterPin(bool isError);
 		void CloseStream(ChiakiQuitEvent *quit);
