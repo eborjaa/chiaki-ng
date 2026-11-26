@@ -19,6 +19,7 @@ class PSRemotePlay : public brls::View
 		~PSRemotePlay();
 
 		void draw(NVGcontext *vg, int x, int y, unsigned width, unsigned height, brls::Style *style, brls::FrameContext *ctx) override;
+		void willAppear(bool resetState = false) override;
 };
 
 
