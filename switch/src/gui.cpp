@@ -4,6 +4,13 @@
 #include <chiaki/log.h>
 #include <chiaki/session.h>
 #include <chrono>
+#include <cstring>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include "views/enter_pin_view.h"
 #include "views/ps_remote_play.h"
 
@@ -32,21 +39,16 @@ HostInterface::HostInterface(Host *host)
 	this->log = this->settings->GetLogger();
 	this->io = IO::GetInstance();
 
+	// Connect wakes the console up by itself when it is in rest mode
 	brls::ListItem *connect = new brls::ListItem("Connect");
 	connect->getClickEvent()->subscribe(std::bind(&HostInterface::Connect, this, std::placeholders::_1));
 	this->addView(connect);
-
-	brls::ListItem *wakeup = new brls::ListItem("Wakeup");
-	wakeup->getClickEvent()->subscribe(std::bind(&HostInterface::Wakeup, this, std::placeholders::_1));
-	this->addView(wakeup);
 
 	// message delimiter
 	brls::Label *info = new brls::Label(brls::LabelStyle::REGULAR,
 		"Host configuration", true);
 	this->addView(info);
 
-	// push opengl chiaki stream
-	// when the host is connected
 	this->host->SetEventConnectedCallback(std::bind(&HostInterface::Stream, this));
 	this->host->SetEventQuitCallback(std::bind(&HostInterface::CloseStream, this, std::placeholders::_1));
 	// push login pin view onto the stack in callback fn
@@ -66,6 +68,9 @@ HostInterface::~HostInterface()
 		this->tick_task->stop();
 		this->tick_task = nullptr; // owned and freed by borealis' task manager
 	}
+	this->cancel_requested = true;
+	if(this->prep_thread.joinable())
+		this->prep_thread.join();
 	Disconnect();
 }
 
@@ -100,63 +105,298 @@ static bool SwitchNetworkUp()
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Reachability probe: the same discovery request the PS app sends. Works over
+// the internet too when UDP 9302 (PS5) / 987 (PS4) is forwarded.
+enum class ProbeResult { Ready, Standby, NoAnswer, ResolveFail };
+
+static ProbeResult ProbeConsole(const std::string &addr, bool ps5, int timeout_ms, std::string *ip_out)
+{
+	struct addrinfo hints = {};
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_DGRAM;
+	struct addrinfo *res = nullptr;
+	if(getaddrinfo(addr.c_str(), nullptr, &hints, &res) != 0 || !res)
+		return ProbeResult::ResolveFail;
+	struct sockaddr_in sa;
+	memcpy(&sa, res->ai_addr, sizeof(sa));
+	freeaddrinfo(res);
+	sa.sin_port = htons(ps5 ? 9302 : 987);
+	if(ip_out)
+	{
+		char buf[INET_ADDRSTRLEN] = {0};
+		inet_ntop(AF_INET, &sa.sin_addr, buf, sizeof(buf));
+		*ip_out = buf;
+	}
+
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if(fd < 0)
+		return ProbeResult::NoAnswer;
+	const char *req = ps5
+		? "SRCH * HTTP/1.1\ndevice-discovery-protocol-version:00030010\n"
+		: "SRCH * HTTP/1.1\ndevice-discovery-protocol-version:00020020\n";
+	sendto(fd, req, strlen(req), 0, (struct sockaddr *)&sa, sizeof(sa));
+
+	ProbeResult result = ProbeResult::NoAnswer;
+	struct pollfd pfd = { fd, POLLIN, 0 };
+	if(poll(&pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN))
+	{
+		char buf[512] = {0};
+		ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+		if(n > 0)
+		{
+			if(strstr(buf, " 200 "))
+				result = ProbeResult::Ready;
+			else if(strstr(buf, " 620 "))
+				result = ProbeResult::Standby;
+		}
+	}
+	close(fd);
+	return result;
+}
+
+// fallback when UDP discovery is filtered: is the Remote Play TCP port open?
+static bool TcpPortOpen(const std::string &ip, int port, int timeout_ms)
+{
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if(fd < 0)
+		return false;
+	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+	struct sockaddr_in sa = {};
+	sa.sin_family = AF_INET;
+	sa.sin_port = htons(port);
+	inet_pton(AF_INET, ip.c_str(), &sa.sin_addr);
+	bool ok = false;
+	if(connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0)
+		ok = true;
+	else if(errno == EINPROGRESS)
+	{
+		struct pollfd pfd = { fd, POLLOUT, 0 };
+		if(poll(&pfd, 1, timeout_ms) > 0)
+		{
+			int err = 0;
+			socklen_t len = sizeof(err);
+			getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+			ok = err == 0;
+		}
+	}
+	close(fd);
+	return ok;
+}
+
+// ---------------------------------------------------------------------------
+
+void HostInterface::SetStatus(const std::string &text)
+{
+	std::lock_guard<std::mutex> lock(this->status_mutex);
+	this->status_text = text;
+}
+
+void HostInterface::Connect(brls::View *view)
+{
+	if(this->conn_state != ConnState::Idle)
+		return;
+
+	if(!this->host->HasRPkey())
+	{
+		// first time: pair with the console (PIN), then connect
+		if(!this->host->IsDiscovered())
+		{
+			ShowError("Can't pair", "The PlayStation must be on the same network as the Switch to pair it the first time.");
+			return;
+		}
+		this->Register();
+		return;
+	}
+
+	CHIAKI_LOGI(this->log, "Connect pressed for %s (target %s)",
+		this->host->GetHostName().c_str(), this->host->GetConnectAddr().c_str());
+
+	this->conn_state = ConnState::Preparing;
+	this->cancel_requested = false;
+	this->prep_done = false;
+	this->prep_ok = false;
+	this->prep_error.clear();
+	this->watchdog_reason.clear();
+	SetStatus("Checking network");
+
+	// "Connecting..." dialog with a live status line
+	this->connecting_label = new brls::Label(brls::LabelStyle::DIALOG, "", true);
+	this->connecting_label->setHorizontalAlign(NVG_ALIGN_CENTER);
+	this->connecting_dialog = new brls::Dialog(this->connecting_label);
+	this->connecting_dialog->addButton("Cancel", [this](brls::View *v) {
+		CHIAKI_LOGI(this->log, "Connect cancelled by user");
+		this->cancel_requested = true;
+		if(this->conn_state == ConnState::Starting)
+			this->host->StopSession();
+	});
+	this->connecting_dialog->setCancelable(false);
+	this->connecting_dialog->open();
+	this->status_dots_ms = 0;
+
+	if(this->prep_thread.joinable())
+		this->prep_thread.join();
+	this->prep_thread = std::thread(&HostInterface::PrepareWorker, this);
+}
+
+// runs on its own thread: everything here may block
+void HostInterface::PrepareWorker()
+{
+	std::string name = this->host->GetHostName();
+	std::string addr = this->host->GetConnectAddr();
+	bool ps5 = this->host->IsPS5();
+	bool local = this->host->IsDiscovered();
+	auto fail = [this](const std::string &msg) {
+		this->prep_error = msg;
+		this->prep_ok = false;
+		this->prep_done = true;
+	};
+
+	if(!SwitchNetworkUp())
+		return fail("No internet connection.\nThe Switch isn't connected to a network.");
+	if(addr.empty())
+		return fail("No address for this PlayStation.\nSet \"Remote IP/name\" in its settings.");
+
+	SetStatus(local ? "Looking for your PS5 on this network" : "Reaching " + addr);
+	std::string ip;
+	ProbeResult probe = ProbeConsole(addr, ps5, 1500, &ip);
+	if(probe == ProbeResult::NoAnswer && !this->cancel_requested)
+		probe = ProbeConsole(addr, ps5, 2000, &ip);
+	if(this->cancel_requested)
+		return fail("");
+	CHIAKI_LOGI(this->log, "Probe %s (%s): %s", addr.c_str(), ip.c_str(),
+		probe == ProbeResult::Ready ? "ready" : probe == ProbeResult::Standby ? "rest mode" :
+		probe == ProbeResult::ResolveFail ? "name not found" : "no answer");
+
+	if(probe == ProbeResult::ResolveFail)
+		return fail("Can't find \"" + addr + "\".\nCheck \"Remote IP/name\", or the internet connection.");
+
+	if(probe == ProbeResult::NoAnswer)
+	{
+		// UDP may be filtered while TCP still gets through; try the session port
+		if(!TcpPortOpen(ip, 9295, 3000))
+			return fail("Can't reach your PS5 at " + addr + ".\n"
+				"It may be fully turned off (not in rest mode), or this network blocks Remote Play.");
+		CHIAKI_LOGI(this->log, "Discovery unanswered but TCP 9295 is open, trying anyway");
+	}
+
+	if(probe == ProbeResult::Standby)
+	{
+		SetStatus("PS5 is in rest mode, waking it up");
+		uint64_t deadline = NowMs() + 45000;
+		uint64_t next_wake = 0;
+		bool awake = false;
+		while(!this->cancel_requested && NowMs() < deadline)
+		{
+			if(NowMs() >= next_wake)
+			{
+				this->host->Wakeup();
+				next_wake = NowMs() + 10000;
+			}
+			if(ProbeConsole(addr, ps5, 2000, nullptr) == ProbeResult::Ready)
+			{
+				awake = true;
+				break;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(500));
+		}
+		if(this->cancel_requested)
+			return fail("");
+		if(!awake)
+			return fail("Your PS5 didn't wake up.\nOn the PS5, enable Settings > System > Power Saving > "
+				"Features Available in Rest Mode > Enable Turning On PS5 from Network.");
+		// Remote Play refuses connections for a moment right after waking
+		SetStatus("PS5 is awake, starting Remote Play");
+		std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+	}
+
+	this->prep_ok = true;
+	this->prep_done = true;
+}
+
+void HostInterface::StartSessionAfterPrep()
+{
+	SetStatus("Starting Remote Play");
+	this->conn_state = ConnState::Starting;
+	try
+	{
+		this->host->InitSession(this->io);
+		this->host->StartSession();
+	}
+	catch(const std::exception &e)
+	{
+		CHIAKI_LOGE(this->log, "Connect failed: %s", e.what());
+		this->host->FiniSession();
+		this->conn_state = ConnState::Idle;
+		CloseConnectingDialog([this, e]() {
+			ShowError("Couldn't connect", std::string("Internal error: ") + e.what());
+		});
+	}
+}
+
 void HostInterface::Tick()
 {
-	// UI thread: tear down a finished session and drive auto-reconnect
+	// UI thread
+	uint64_t now = NowMs();
+
+	if(this->pending_register_connect.exchange(false))
+		Connect(nullptr);
+
+	// animate the connecting dialog
+	if(this->connecting_label && now - this->status_dots_ms >= 400)
+	{
+		this->status_dots_ms = now;
+		this->status_dots = (this->status_dots + 1) % 4;
+		std::string text;
+		{
+			std::lock_guard<std::mutex> lock(this->status_mutex);
+			text = this->status_text;
+		}
+		this->connecting_label->setText("Connecting to " + this->host->GetHostName() + "\n\n"
+			+ text + std::string(this->status_dots, '.') + std::string(3 - this->status_dots, ' '));
+	}
+
+	if(this->conn_state == ConnState::Preparing && this->prep_done)
+	{
+		if(this->prep_thread.joinable())
+			this->prep_thread.join();
+		if(this->cancel_requested || !this->prep_ok)
+		{
+			this->conn_state = ConnState::Idle;
+			std::string err = this->prep_error;
+			CloseConnectingDialog([this, err]() {
+				if(!err.empty())
+					ShowError("Couldn't connect", err);
+			});
+			if(!err.empty())
+				CHIAKI_LOGW(this->log, "Connect aborted: %s", err.c_str());
+		}
+		else
+			StartSessionAfterPrep();
+	}
+
+	if(this->pending_connected.exchange(false) && this->conn_state == ConnState::Starting)
+	{
+		this->conn_state = ConnState::Streaming;
+		this->watch_start_ms = 0;
+		CloseConnectingDialog([this]() {
+			// https://github.com/natinusala/borealis/issues/59
+			// disable 60 fps limit
+			brls::Application::setMaximumFPS(0);
+			brls::Application::pushView(new PSRemotePlay(this->host));
+			this->stream_view_shown = true;
+		});
+	}
+
 	if(this->pending_close.exchange(false))
 		HandleSessionClosed();
 
-	uint64_t now = NowMs();
 	Watchdog(now);
-
-	if(this->reconnect_state == ReconnectState::Idle)
-		return;
-
-	if(now < this->reconnect_next_ms)
-		return;
-
-	switch(this->reconnect_state)
-	{
-		case ReconnectState::WaitNetwork:
-			if(!SwitchNetworkUp())
-			{
-				if(now > this->reconnect_deadline_ms)
-				{
-					CHIAKI_LOGW(this->log, "Auto-reconnect: network did not come back, giving up");
-					brls::Application::notify("Reconnect cancelled: no network");
-					CancelReconnect();
-				}
-				else
-					this->reconnect_next_ms = now + 1000;
-				break;
-			}
-			CHIAKI_LOGI(this->log, "Auto-reconnect attempt %d/%d: network up, waking PlayStation",
-				this->reconnect_attempt, RECONNECT_MAX_ATTEMPTS);
-			if(this->host->HasRPkey())
-				this->host->Wakeup(); // harmless if the console is already awake
-			this->reconnect_state = ReconnectState::WaitWake;
-			// first attempt right away in case it never slept, later ones give it time to boot
-			this->reconnect_next_ms = now + (this->reconnect_attempt == 1 ? 1500 : RECONNECT_WAKE_DELAY_MS);
-			break;
-
-		case ReconnectState::WaitWake:
-			this->reconnect_state = ReconnectState::Idle; // ConnectSession / quit handling decide what's next
-			CHIAKI_LOGI(this->log, "Auto-reconnect attempt %d/%d: connecting",
-				this->reconnect_attempt, RECONNECT_MAX_ATTEMPTS);
-			brls::Application::notify(fmt::format("Reconnecting... ({}/{})",
-				this->reconnect_attempt, RECONNECT_MAX_ATTEMPTS));
-			if(!ConnectSession())
-				ScheduleReconnect("connect failed");
-			break;
-
-		default:
-			break;
-	}
 }
 
 void HostInterface::Watchdog(uint64_t now)
 {
-	if(!this->connected || this->watchdog_stop_sent)
+	if(this->conn_state != ConnState::Streaming || !this->watchdog_reason.empty())
 		return;
 	if(this->watch_start_ms == 0)
 		this->watch_start_ms = now;
@@ -175,70 +415,108 @@ void HostInterface::Watchdog(uint64_t now)
 
 	if(stalled || net_down)
 	{
-		CHIAKI_LOGW(this->log, "Watchdog: %s, stopping session so it can reconnect",
-			net_down ? "Switch network is down" : "no video for 5 s");
-		this->watchdog_stop_sent = true;
+		// chiaki doesn't end the session on its own when the network is gone
+		this->watchdog_reason = net_down
+			? "The Switch lost its network connection."
+			: "The PS5 stopped sending video (connection lost).";
+		CHIAKI_LOGW(this->log, "Watchdog: %s Stopping session.", this->watchdog_reason.c_str());
 		this->host->StopSession();
+	}
+}
+
+std::string HostInterface::QuitReasonMessage(ChiakiQuitReason reason, bool was_streaming)
+{
+	switch(reason)
+	{
+		case CHIAKI_QUIT_REASON_SESSION_REQUEST_UNKNOWN:
+			return "Your PS5 didn't answer the Remote Play request.\n"
+				"This network may block Remote Play, or the PS5 is still starting up.";
+		case CHIAKI_QUIT_REASON_SESSION_REQUEST_CONNECTION_REFUSED:
+			return "Your PS5 refused the connection.\nIt may still be waking up, try again in a few seconds.";
+		case CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_IN_USE:
+			return "Remote Play is already in use by another device.";
+		case CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_CRASH:
+			return "Remote Play crashed on the PS5.\nRestart the PS5 and try again.";
+		case CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_VERSION_MISMATCH:
+			return "This PS5's Remote Play version isn't supported.";
+		case CHIAKI_QUIT_REASON_CTRL_CONNECT_FAILED:
+		case CHIAKI_QUIT_REASON_CTRL_CONNECTION_REFUSED:
+		case CHIAKI_QUIT_REASON_CTRL_UNKNOWN:
+			return was_streaming ? "The connection to your PS5 was lost."
+				: "Couldn't open the control connection to your PS5.";
+		case CHIAKI_QUIT_REASON_STREAM_CONNECTION_UNKNOWN:
+			return was_streaming ? "The connection to your PS5 was lost."
+				: "The video stream couldn't be set up.\nThis network may block Remote Play video (UDP).";
+		case CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_DISCONNECTED:
+			return "Your PS5 ended the Remote Play session.";
+		case CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_SHUTDOWN:
+			return "Your PS5 was turned off or went into rest mode.";
+		case CHIAKI_QUIT_REASON_PSN_REGIST_FAILED:
+			return "PSN registration failed.";
+		default:
+			return chiaki_quit_reason_string(reason);
 	}
 }
 
 void HostInterface::HandleSessionClosed()
 {
-	bool was_streaming = this->connected;
-	this->watch_start_ms = 0;
-	this->watchdog_stop_sent = false;
+	ConnState state = this->conn_state;
 	ChiakiQuitReason reason = (ChiakiQuitReason)this->pending_reason.load();
+	bool cancelled = this->cancel_requested.exchange(false);
+	std::string watchdog = this->watchdog_reason;
+	this->watchdog_reason.clear();
+	this->watch_start_ms = 0;
+	this->conn_state = ConnState::Idle;
 
-	brls::Application::unblockInputs();
 	brls::Application::setMaximumFPS(60);
-	Disconnect();
+	Disconnect(); // pops the stream view if it was shown, joins + frees the session
 
-	// reconnect when a running stream dropped (e.g. Switch sleep / Wi-Fi loss),
-	// or while we are already in a reconnect cycle; not when the PS5 shut down
-	// a stream that was actually playing starts a fresh reconnect cycle
-	if(was_streaming)
-		CancelReconnect();
-	bool wanted = (was_streaming || this->reconnect_active)
-		&& reason != CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_SHUTDOWN
-		&& reason != CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_IN_USE;
-	if(wanted)
-		ScheduleReconnect(chiaki_quit_reason_string(reason));
-	else
+	if(state == ConnState::Streaming)
 	{
-		CancelReconnect();
-		brls::Application::notify(chiaki_quit_reason_string(reason));
+		std::string msg = !watchdog.empty() ? watchdog : QuitReasonMessage(reason, true);
+		CHIAKI_LOGI(this->log, "Disconnected: %s", msg.c_str());
+		ShowDisconnected(msg);
+	}
+	else if(state == ConnState::Starting)
+	{
+		std::string msg = QuitReasonMessage(reason, false);
+		CloseConnectingDialog([this, msg, cancelled]() {
+			if(!cancelled)
+				ShowError("Couldn't connect", msg);
+		});
 	}
 }
 
-void HostInterface::ScheduleReconnect(const char *why)
+void HostInterface::CloseConnectingDialog(std::function<void(void)> then)
 {
-	if(!this->reconnect_active)
+	if(this->connecting_dialog)
 	{
-		this->reconnect_active = true;
-		this->reconnect_attempt = 0;
-		this->reconnect_deadline_ms = NowMs() + RECONNECT_NETWORK_TIMEOUT_MS;
+		brls::Dialog *d = this->connecting_dialog;
+		this->connecting_dialog = nullptr;
+		this->connecting_label = nullptr;
+		d->close(then);
 	}
-	if(this->reconnect_attempt >= RECONNECT_MAX_ATTEMPTS)
-	{
-		CHIAKI_LOGW(this->log, "Auto-reconnect: giving up after %d attempts (%s)", this->reconnect_attempt, why);
-		brls::Application::notify("Could not reconnect, press Connect to retry");
-		CancelReconnect();
-		return;
-	}
-	this->reconnect_attempt++;
-	CHIAKI_LOGI(this->log, "Auto-reconnect scheduled (attempt %d/%d) after: %s",
-		this->reconnect_attempt, RECONNECT_MAX_ATTEMPTS, why);
-	if(this->reconnect_attempt == 1)
-		brls::Application::notify("Connection lost, reconnecting...");
-	this->reconnect_state = ReconnectState::WaitNetwork;
-	this->reconnect_next_ms = NowMs() + 1000;
+	else if(then)
+		then();
 }
 
-void HostInterface::CancelReconnect()
+void HostInterface::ShowError(const std::string &title, const std::string &message)
 {
-	this->reconnect_state = ReconnectState::Idle;
-	this->reconnect_active = false;
-	this->reconnect_attempt = 0;
+	brls::Dialog *d = new brls::Dialog(title + "\n\n" + message);
+	d->addButton("OK", [d](brls::View *v) { d->close(); });
+	d->setCancelable(true);
+	d->open();
+}
+
+void HostInterface::ShowDisconnected(const std::string &message)
+{
+	brls::Dialog *d = new brls::Dialog("Disconnected from " + this->host->GetHostName() + "\n\n" + message);
+	d->addButton("Reconnect", [this, d](brls::View *v) {
+		d->close([this]() { this->Connect(nullptr); });
+	});
+	d->addButton("Close", [d](brls::View *v) { d->close(); });
+	d->setCancelable(true);
+	d->open();
 }
 
 void HostInterface::Register(Host *host, std::function<void()> success_cb)
@@ -318,122 +596,34 @@ void HostInterface::Register(Host *host, std::function<void()> success_cb)
 
 void HostInterface::Register()
 {
-	// use Connect just after the registration to save user inputs
-	HostInterface::Register(this->host, std::bind(&HostInterface::ConnectSession, this));
-}
-
-void HostInterface::Wakeup(brls::View *view)
-{
-	if(!this->host->HasRPkey())
-	{
-		// the host is not registered yet
-		this->Register();
-	}
-	else
-	{
-		int r = host->Wakeup();
-		if(r == 0)
-		{
-			brls::Application::notify("Wakeup packet sent to PlayStation");
-		}
-		else
-		{
-			brls::Application::notify("Wakeup packet sent, no response from PlayStation");
-		}
-	}
-}
-
-void HostInterface::Connect(brls::View *view)
-{
-	// a manual connect replaces any auto-reconnect in progress
-	CancelReconnect();
-
-	// check that all requirements are met
-	if(!this->host->IsDiscovered() && !this->host->HasRPkey())
-	{
-		// at this point the host must be discovered or registered manually
-		// to validate the system_version accuracy
-		brls::Application::crash("Undefined PlayStation remote version");
-	}
-
-	// ignore state for remote hosts
-	if(this->host->IsDiscovered() && !this->host->IsReady())
-	{
-		// host in standby mode
-		DIALOG(ptoyp, "Your PlayStation is off, please turn it on");
-		return;
-	}
-
-	if(!this->host->HasRPkey())
-	{
-		this->Register();
-	}
-	else
-	{
-		// the host is already registered
-		// start session directly
-		ConnectSession();
-	}
-}
-
-bool HostInterface::ConnectSession()
-{
-	// ignore all user inputs (avoid double connect)
-	// user inputs are restored with the CloseStream
-	brls::Application::blockInputs();
-
-	// connect host sesssion
-	CHIAKI_LOGI(this->log, "Connecting to %s (%s)",
-		this->host->GetHostName().c_str(), this->host->GetHostAddr().c_str());
-	try
-	{
-		this->host->InitSession(this->io);
-		CHIAKI_LOGI(this->log, "Session initiated");
-		this->host->StartSession();
-	}
-	catch(const std::exception &e)
-	{
-		// show the error instead of aborting the whole app
-		CHIAKI_LOGE(this->log, "Connect failed: %s", e.what());
-		this->host->FiniSession();
-		brls::Application::unblockInputs();
-		brls::Application::notify(std::string("Connect failed: ") + e.what());
-		return false;
-	}
-	return true;
+	// connect right after a successful registration; the callback runs on a
+	// chiaki thread, so hand it to the UI thread
+	HostInterface::Register(this->host, [this]() { this->pending_register_connect = true; });
 }
 
 void HostInterface::Disconnect()
 {
-	if(this->connected)
+	if(this->conn_state == ConnState::Streaming)
+		this->conn_state = ConnState::Idle;
+	// the stream view is the top view only while streaming
+	if(this->stream_view_shown)
 	{
+		this->stream_view_shown = false;
 		brls::Application::popView();
-		this->host->StopSession();
-		this->connected = false;
 	}
-
+	this->host->StopSession();
 	this->host->FiniSession();
 }
 
 void HostInterface::Stream()
 {
-	this->connected = true;
-	// https://github.com/natinusala/borealis/issues/59
-	// disable 60 fps limit
-	brls::Application::setMaximumFPS(0);
-
-	// show FPS counter
-	// brls::Application::setDisplayFramerate(true);
-
-	// push raw opengl stream over borealis
-	brls::Application::pushView(new PSRemotePlay(this->host));
+	// chiaki session thread: the UI thread pushes the stream view
+	this->pending_connected = true;
 }
 
 void HostInterface::CloseStream(ChiakiQuitEvent *quit)
 {
-	// session QUIT call back: runs on chiaki's session thread, so only record
-	// it here; Tick() (UI thread) joins/frees the session and may reconnect.
-	// (Calling Disconnect() here joined the session thread from itself.)
+	// chiaki session thread: only record it; Tick() (UI thread) cleans up
 	CHIAKI_LOGI(this->log, "Session quit: %s%s%s", chiaki_quit_reason_string(quit->reason),
 		quit->reason_str ? " - " : "", quit->reason_str ? quit->reason_str : "");
 	this->pending_reason = (int)quit->reason;

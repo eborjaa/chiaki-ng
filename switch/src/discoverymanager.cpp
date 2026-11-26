@@ -19,6 +19,9 @@
 static void Discovery(ChiakiDiscoveryHost *discovered_hosts, size_t hosts_count, void *user)
 {
 	DiscoveryManager *dm = (DiscoveryManager *)user;
+	// the service reports the full list of consoles currently answering;
+	// anything missing is no longer on this network (e.g. we left home)
+	dm->MarkAllUndiscovered();
 	for(size_t i = 0; i < hosts_count; i++)
 	{
 		dm->DiscoveryCB(discovered_hosts + i);
@@ -28,6 +31,16 @@ static void Discovery(ChiakiDiscoveryHost *discovered_hosts, size_t hosts_count,
 static size_t WriteCallback(void *contents, size_t size, size_t nmemb, std::string *userp) {
     userp->append((char*)contents, size * nmemb);
     return size * nmemb;
+}
+
+void DiscoveryManager::MarkAllUndiscovered()
+{
+	std::map<std::string, Host> *hosts = this->settings->GetHostsMap();
+	for(auto it = hosts->begin(); it != hosts->end(); it++)
+	{
+		it->second.discovered = false;
+		it->second.state = CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN;
+	}
 }
 
 DiscoveryManager::DiscoveryManager()
@@ -215,7 +228,8 @@ void DiscoveryManager::DiscoveryCB(ChiakiDiscoveryHost *discovered_host)
 
 	if(discovered_host->host_addr)
 	{
-		host->host_addr = discovered_host->host_addr;
+		// never overwrite the user's configured address (e.g. a DDNS name)
+		host->discovered_addr = discovered_host->host_addr;
 		CHIAKI_LOGI(this->log, "Host Addr:                         %s", discovered_host->host_addr);
 	}
 

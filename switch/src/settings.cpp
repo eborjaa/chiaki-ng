@@ -265,9 +265,11 @@ int Settings::WriteFile()
 			// second is Host
 			CHIAKI_LOGD(&this->log, "Write Host config file %s", it->first.c_str());
 
-			config_file << "[" << it->first << "]\n"
-						<< "host_addr = \"" << it->second.GetHostAddr() << "\"\n"
-						<< "target = \"" << it->second.GetChiakiTarget() << "\"\n";
+			config_file << "[" << it->first << "]\n";
+			// only the user-configured address is saved; LAN discovery is never persisted
+			if(!it->second.GetHostAddr().empty())
+				config_file << "host_addr = \"" << it->second.GetHostAddr() << "\"\n";
+			config_file << "target = \"" << it->second.GetChiakiTarget() << "\"\n";
 
 			if(it->second.video_resolution)
 				config_file << "video_resolution = \""

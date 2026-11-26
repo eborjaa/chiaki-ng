@@ -10,6 +10,8 @@
 #include "nanovg_gl_utils.h"
 
 #include <atomic>
+#include <functional>
+#include <mutex>
 #include <map>
 #include <thread>
 #include <fmt/format.h>
@@ -44,31 +46,50 @@ class HostInterface : public brls::List
 		Host *host;
 		Settings *settings;
 		ChiakiLog *log = nullptr;
-		std::atomic<bool> connected{false};
 
-		// session quit handling + auto-reconnect (driven by Tick on the UI thread)
-		enum class ReconnectState { Idle, WaitNetwork, WaitWake };
-		static const int RECONNECT_MAX_ATTEMPTS = 12;
-		static const uint64_t RECONNECT_NETWORK_TIMEOUT_MS = 180000;
-		static const uint64_t RECONNECT_WAKE_DELAY_MS = 6000;
+		// connection state machine, driven by Tick() on the UI thread.
+		// chiaki/session callbacks only set atomics; the UI thread acts on them.
+		enum class ConnState { Idle, Preparing, Starting, Streaming };
+		ConnState conn_state = ConnState::Idle;
+		bool stream_view_shown = false;
 		HostTickTask *tick_task = nullptr;
+
+		// "Connecting..." dialog
+		brls::Dialog *connecting_dialog = nullptr;
+		brls::Label *connecting_label = nullptr;
+		std::mutex status_mutex;
+		std::string status_text;
+		int status_dots = 0;
+		uint64_t status_dots_ms = 0;
+
+		// preparation worker (network check, reachability probe, wake-up)
+		std::thread prep_thread;
+		std::atomic<bool> prep_done{false};
+		std::atomic<bool> prep_ok{false};
+		std::atomic<bool> cancel_requested{false};
+		std::string prep_error;
+
+		// session events (set from chiaki threads)
+		std::atomic<bool> pending_connected{false};
 		std::atomic<bool> pending_close{false};
 		std::atomic<int> pending_reason{0};
-		ReconnectState reconnect_state = ReconnectState::Idle;
-		int reconnect_attempt = 0;
-		uint64_t reconnect_deadline_ms = 0;
-		uint64_t reconnect_next_ms = 0;
-		bool reconnect_active = false;
-		// stall watchdog: chiaki keeps a dead session alive after Wi-Fi loss,
-		// so stop it ourselves when video stops or the network is down
+		std::atomic<bool> pending_register_connect{false};
+
+		// stall watchdog: chiaki keeps a dead session alive after Wi-Fi loss
 		static const uint64_t STALL_TIMEOUT_MS = 5000;
 		uint64_t watch_start_ms = 0;
 		uint64_t last_net_check_ms = 0;
-		bool watchdog_stop_sent = false;
-		void Watchdog(uint64_t now);
+		std::string watchdog_reason;
+
+		void SetStatus(const std::string &text);
+		void PrepareWorker();
+		void StartSessionAfterPrep();
 		void HandleSessionClosed();
-		void ScheduleReconnect(const char *why);
-		void CancelReconnect();
+		void Watchdog(uint64_t now);
+		void CloseConnectingDialog(std::function<void(void)> then = nullptr);
+		void ShowError(const std::string &title, const std::string &message);
+		void ShowDisconnected(const std::string &message);
+		static std::string QuitReasonMessage(ChiakiQuitReason reason, bool was_streaming);
 
 	public:
 		void Tick();
@@ -77,9 +98,7 @@ class HostInterface : public brls::List
 
 		static void Register(Host *host, std::function<void()> success_cb = nullptr);
 		void Register();
-		void Wakeup(brls::View *view);
 		void Connect(brls::View *view);
-		bool ConnectSession();
 		void Disconnect();
 		void Stream();
 		void EnterPin(bool isError);

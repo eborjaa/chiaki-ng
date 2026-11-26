@@ -69,7 +69,12 @@ class Host
 		std::string host_name;
 		// sony's host_id == mac addr without colon
 		std::string host_id;
+		// address the user configured ("Remote IP/name"); the only one persisted
 		std::string host_addr;
+		// LAN address from discovery; only valid while discovered is true
+		std::string discovered_addr;
+		// address used by the current session/registration (keeps c_str() alive)
+		std::string session_addr;
 		std::string ap_ssid;
 		std::string ap_bssid;
 		std::string ap_key;
@@ -111,6 +116,8 @@ class Host
 		bool GetVideoResolution(int *ret_width, int *ret_height);
 		std::string GetHostName();
 		std::string GetHostAddr();
+		// LAN address when the console is visible on this network, else the configured one
+		std::string GetConnectAddr();
 		ChiakiTarget GetChiakiTarget();
 		void SetChiakiTarget(ChiakiTarget target);
 		void SetHostAddr(std::string host_addr);

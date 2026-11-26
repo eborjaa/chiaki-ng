@@ -68,8 +68,9 @@ int Host::Wakeup()
 	}
 
 	uint64_t credential = (uint64_t)strtoull(this->rp_regist_key, NULL, 16);
+	std::string addr = this->GetConnectAddr();
 	ChiakiErrorCode ret = chiaki_discovery_wakeup(this->log, NULL,
-		host_addr.c_str(), credential, this->IsPS5());
+		addr.c_str(), credential, this->IsPS5());
 
 	if(ret == CHIAKI_ERR_SUCCESS)
 	{
@@ -126,15 +127,16 @@ int Host::Register(int pin)
 	}
 
 	this->regist_info.pin = pin;
-	this->regist_info.host = this->host_addr.c_str();
+	this->session_addr = this->GetConnectAddr();
+	this->regist_info.host = this->session_addr.c_str();
 	this->regist_info.broadcast = false;
 
 	if(this->target >= CHIAKI_TARGET_PS4_9)
 		CHIAKI_LOGI(this->log, "Registering to host `%s` `%s` with PSN AccountID `%s` pin `%d`",
-			this->host_name.c_str(), this->host_addr.c_str(), account_id.c_str(), pin);
+			this->host_name.c_str(), this->session_addr.c_str(), account_id.c_str(), pin);
 	else
 		CHIAKI_LOGI(this->log, "Registering to host `%s` `%s` with PSN OnlineID `%s` pin `%d`",
-			this->host_name.c_str(), this->host_addr.c_str(), online_id.c_str(), pin);
+			this->host_name.c_str(), this->session_addr.c_str(), online_id.c_str(), pin);
 
 	chiaki_regist_start(&this->regist, this->log, &this->regist_info, RegistEventCB, this);
 	return HOST_REGISTER_OK;
@@ -152,7 +154,10 @@ int Host::InitSession(IO *user)
 	haptics_sink.frame_cb = HapticsFrameCb;
 	ChiakiConnectInfo chiaki_connect_info = {};
 
-	chiaki_connect_info.host = this->host_addr.c_str();
+	this->session_addr = this->GetConnectAddr();
+	CHIAKI_LOGI(this->log, "Session target: %s (%s)", this->session_addr.c_str(),
+		(this->discovered && !this->discovered_addr.empty()) ? "local network" : "configured address");
+	chiaki_connect_info.host = this->session_addr.c_str();
 	chiaki_connect_info.video_profile = this->video_profile;
 	chiaki_connect_info.video_profile_auto_downgrade = true;
 	if (this->IsPS5()) {
@@ -353,6 +358,15 @@ std::string Host::GetHostName()
 std::string Host::GetHostAddr()
 {
 	return this->host_addr;
+}
+
+std::string Host::GetConnectAddr()
+{
+	if(this->discovered && !this->discovered_addr.empty())
+		return this->discovered_addr;
+	if(!this->host_addr.empty())
+		return this->host_addr;
+	return this->discovered_addr;
 }
 
 ChiakiTarget Host::GetChiakiTarget()
