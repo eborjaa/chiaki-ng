@@ -348,8 +348,19 @@ void HostInterface::PrepareWorker()
 			probe == ProbeResult::Ready ? "ready" : probe == ProbeResult::Standby ? "rest mode" :
 			probe == ProbeResult::ResolveFail ? "name not found" : "no answer");
 
+		std::string known_ip;
+		{
+			std::lock_guard<std::mutex> lock(this->ip_mutex);
+			known_ip = this->last_good_ip;
+		}
 		if(probe == ProbeResult::Ready || probe == ProbeResult::Standby)
+		{
+			if(!known_ip.empty() && ip != known_ip)
+				CHIAKI_LOGI(this->log, "Home address changed: %s -> %s", known_ip.c_str(), ip.c_str());
+			std::lock_guard<std::mutex> lock(this->ip_mutex);
+			this->last_good_ip = ip;
 			break;
+		}
 
 		uint64_t deadline = this->connect_deadline_ms;
 		uint64_t next = attempt_start + ATTEMPT_INTERVAL_MS;
@@ -367,8 +378,10 @@ void HostInterface::PrepareWorker()
 		}
 		if(probe == ProbeResult::ResolveFail)
 			SetStatus("Can't find \"" + addr + "\" yet. Still trying");
+		else if(ip_changed || (!known_ip.empty() && ip != known_ip))
+			SetStatus("Your home address changed, reaching the new one.\nStill trying");
 		else
-			SetStatus("Can't reach your PS5 yet. Your home internet address may have changed.\nStill trying");
+			SetStatus("Can't reach your PS5 yet. Your home internet may be down\nor its address is changing. Still trying");
 		this->show_countdown = true;
 		if(!SleepUnlessCancelled(next - NowMs()))
 			return fail("");
@@ -662,7 +675,9 @@ void HostInterface::CloseConnectingDialog(std::function<void(void)> then)
 		brls::Dialog *d = this->connecting_dialog;
 		this->connecting_dialog = nullptr;
 		this->connecting_label = nullptr;
-		d->close(then);
+		// borealis calls the close callback unconditionally: an empty
+		// std::function throws bad_function_call, which aborts the app
+		d->close(then ? then : []() {});
 	}
 	else if(then)
 		then();

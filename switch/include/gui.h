@@ -86,6 +86,10 @@ class HostInterface : public brls::List
 		static const uint64_t ATTEMPT_INTERVAL_MS = 5000;
 		std::atomic<uint64_t> connect_deadline_ms{0};
 		std::atomic<bool> show_countdown{false};
+		// address the PS5 last answered on (this run only): lets the status say
+		// "address changed" only when it really did
+		std::mutex ip_mutex;
+		std::string last_good_ip;
 		bool retry_active = false;
 		uint64_t retry_at_ms = 0;
 		static bool RetryableQuit(ChiakiQuitReason reason);
