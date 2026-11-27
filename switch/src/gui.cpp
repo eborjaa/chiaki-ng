@@ -238,13 +238,10 @@ void HostInterface::Connect(brls::View *view)
 	CHIAKI_LOGI(this->log, "Connect pressed for %s (target %s)",
 		this->host->GetHostName().c_str(), this->host->GetConnectAddr().c_str());
 
-	this->conn_state = ConnState::Preparing;
 	this->cancel_requested = false;
 	this->retry_active = false;
-	this->retry_deadline_ms = 0;
-	this->prep_done = false;
-	this->prep_ok = false;
-	this->prep_error.clear();
+	this->show_countdown = false;
+	this->connect_deadline_ms = NowMs() + CONNECT_WINDOW_MS;
 	this->watchdog_reason.clear();
 	SetStatus("Checking network");
 
@@ -256,7 +253,7 @@ void HostInterface::Connect(brls::View *view)
 		CHIAKI_LOGI(this->log, "Connect cancelled by user");
 		this->cancel_requested = true;
 		this->retry_active = false;
-		this->retry_deadline_ms = 0;
+		this->show_countdown = false;
 		if(this->conn_state == ConnState::Starting)
 			this->host->StopSession();
 		// close immediately; the worker and the session callbacks see the flag
@@ -267,9 +264,27 @@ void HostInterface::Connect(brls::View *view)
 	this->connecting_dialog->open();
 	this->status_dots_ms = 0;
 
+	StartPrep();
+}
+
+void HostInterface::StartPrep()
+{
+	this->conn_state = ConnState::Preparing;
+	this->prep_done = false;
+	this->prep_ok = false;
+	this->prep_error.clear();
 	if(this->prep_thread.joinable())
 		this->prep_thread.join();
 	this->prep_thread = std::thread(&HostInterface::PrepareWorker, this);
+}
+
+// false when Cancel was pressed meanwhile
+bool HostInterface::SleepUnlessCancelled(uint64_t ms)
+{
+	uint64_t end = NowMs() + ms;
+	while(!this->cancel_requested && NowMs() < end)
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	return !this->cancel_requested;
 }
 
 // runs on its own thread: everything here may block
@@ -290,32 +305,79 @@ void HostInterface::PrepareWorker()
 	if(addr.empty())
 		return fail("No address for this PlayStation.\nSet \"Remote IP/name\" in its settings.");
 
-	SetStatus(local ? "Looking for your PS5 on this network" : "Reaching " + addr);
-	std::string ip;
-	ProbeResult probe = ProbeConsole(addr, ps5, 1500, &ip, &this->cancel_requested);
-	if(probe == ProbeResult::NoAnswer && !this->cancel_requested)
-		probe = ProbeConsole(addr, ps5, 2000, &ip, &this->cancel_requested);
-	if(this->cancel_requested)
-		return fail("");
-	CHIAKI_LOGI(this->log, "Probe %s (%s): %s", addr.c_str(), ip.c_str(),
-		probe == ProbeResult::Ready ? "ready" : probe == ProbeResult::Standby ? "rest mode" :
-		probe == ProbeResult::ResolveFail ? "name not found" : "no answer");
-
-	if(probe == ProbeResult::ResolveFail)
-		return fail("Can't find \"" + addr + "\".\nCheck \"Remote IP/name\", or the internet connection.");
-
-	if(probe == ProbeResult::NoAnswer)
+	// Keep trying until the connect window closes. Every attempt resolves the
+	// name again, so a new home IP is picked up as soon as DDNS has it.
+	std::string ip, first_ip;
+	ProbeResult probe = ProbeResult::NoAnswer;
+	bool ip_changed = false;
+	int attempt = 0;
+	while(true)
 	{
-		// UDP may be filtered while TCP still gets through; try the session port
-		if(!TcpPortOpen(ip, 9295, 3000, &this->cancel_requested))
-			return fail("Can't reach your PS5 at " + addr + ".\n"
-				"It may be fully turned off (not in rest mode), or this network blocks Remote Play.");
-		CHIAKI_LOGI(this->log, "Discovery unanswered but TCP 9295 is open, trying anyway");
+		attempt++;
+		uint64_t attempt_start = NowMs();
+		if(!SwitchNetworkUp())
+			return fail("No internet connection.\nThe Switch isn't connected to a network.");
+		if(attempt == 1)
+			SetStatus(local ? "Looking for your PS5 on this network" : "Looking for your PS5");
+
+		ip.clear();
+		probe = ProbeConsole(addr, ps5, 1500, &ip, &this->cancel_requested);
+		if(probe == ProbeResult::NoAnswer && !this->cancel_requested)
+			probe = ProbeConsole(addr, ps5, 2000, &ip, &this->cancel_requested);
+		if(probe == ProbeResult::NoAnswer && !this->cancel_requested && !ip.empty()
+			&& TcpPortOpen(ip, 9295, 3000, &this->cancel_requested))
+		{
+			// UDP discovery may be filtered while the session port still works
+			CHIAKI_LOGI(this->log, "Discovery unanswered but TCP 9295 is open, trying anyway");
+			probe = ProbeResult::Ready;
+		}
+		if(this->cancel_requested)
+			return fail("");
+		if(!ip.empty())
+		{
+			if(first_ip.empty())
+				first_ip = ip;
+			else if(ip != first_ip && !ip_changed)
+			{
+				ip_changed = true;
+				CHIAKI_LOGI(this->log, "%s now resolves to a new address (%s, was %s)",
+					addr.c_str(), ip.c_str(), first_ip.c_str());
+			}
+		}
+		CHIAKI_LOGI(this->log, "Probe %d %s (%s): %s", attempt, addr.c_str(), ip.c_str(),
+			probe == ProbeResult::Ready ? "ready" : probe == ProbeResult::Standby ? "rest mode" :
+			probe == ProbeResult::ResolveFail ? "name not found" : "no answer");
+
+		if(probe == ProbeResult::Ready || probe == ProbeResult::Standby)
+			break;
+
+		uint64_t deadline = this->connect_deadline_ms;
+		uint64_t next = attempt_start + ATTEMPT_INTERVAL_MS;
+		if(next < NowMs())
+			next = NowMs();
+		if(next >= deadline)
+		{
+			this->show_countdown = false;
+			if(probe == ProbeResult::ResolveFail)
+				return fail("Can't find \"" + addr + "\".\n"
+					"Check \"Remote IP/name\" in the PS5's settings, or this network's internet connection.");
+			return fail("Your PS5 didn't answer.\n"
+				"It may be fully turned off (not in rest mode), your home internet may be down,\n"
+				"or your home address hasn't updated yet. Try again in a minute.");
+		}
+		if(probe == ProbeResult::ResolveFail)
+			SetStatus("Can't find \"" + addr + "\" yet. Still trying");
+		else
+			SetStatus("Can't reach your PS5 yet. Your home internet address may have changed.\nStill trying");
+		this->show_countdown = true;
+		if(!SleepUnlessCancelled(next - NowMs()))
+			return fail("");
 	}
+	this->show_countdown = false;
 
 	if(probe == ProbeResult::Standby)
 	{
-		SetStatus("PS5 is in rest mode, waking it up");
+		SetStatus("Waking your PS5");
 		uint64_t deadline = NowMs() + 45000;
 		uint64_t next_wake = 0;
 		bool awake = false;
@@ -393,17 +455,24 @@ void HostInterface::Tick()
 			std::lock_guard<std::mutex> lock(this->status_mutex);
 			text = this->status_text;
 		}
-		this->connecting_label->setText("Connecting to " + this->host->GetHostName() + "\n\n"
-			+ text + std::string(this->status_dots, '.') + std::string(3 - this->status_dots, ' '));
+		std::string dots = std::string(this->status_dots, '.') + std::string(3 - this->status_dots, ' ');
+		if(this->show_countdown)
+		{
+			uint64_t deadline = this->connect_deadline_ms;
+			uint64_t left = deadline > now ? (deadline - now + 999) / 1000 : 0;
+			dots += fmt::format(" ({}:{:02d} left)", left / 60, left % 60);
+		}
+		this->connecting_label->setText("Connecting to " + this->host->GetHostName() + "\n\n" + text + dots);
 	}
 
-	// "already in use" retry: one session start every RETRY_DELAY_MS until the
-	// window closes, keeping the connecting dialog on screen
+	// session refused (busy / still waking): try again within the same window,
+	// running the whole preparation again so the address is looked up afresh
 	if(this->retry_active && this->conn_state == ConnState::Idle && now >= this->retry_at_ms)
 	{
 		this->retry_active = false;
-		CHIAKI_LOGI(this->log, "Retrying connection, the console should be free now");
-		StartSessionAfterPrep();
+		this->show_countdown = false;
+		CHIAKI_LOGI(this->log, "Retrying connection");
+		StartPrep();
 	}
 
 	if(this->conn_state == ConnState::Preparing && this->prep_done)
@@ -439,7 +508,7 @@ void HostInterface::Tick()
 		{
 			this->conn_state = ConnState::Streaming;
 			this->retry_active = false;
-			this->retry_deadline_ms = 0;
+			this->show_countdown = false;
 			this->watch_start_ms = 0;
 			CloseConnectingDialog([this]() {
 				// https://github.com/natinusala/borealis/issues/59
@@ -561,22 +630,22 @@ void HostInterface::HandleSessionClosed()
 	{
 		uint64_t now = NowMs();
 		bool retry = !cancelled && RetryableQuit(reason)
-			&& (this->retry_deadline_ms == 0 || now < this->retry_deadline_ms);
+			&& now + ATTEMPT_INTERVAL_MS < this->connect_deadline_ms;
 		std::string msg = QuitReasonMessage(reason, false);
 		Disconnect();
 		if(retry)
 		{
-			if(this->retry_deadline_ms == 0)
-				this->retry_deadline_ms = now + RETRY_WINDOW_MS;
-			this->retry_at_ms = now + RETRY_DELAY_MS;
+			this->retry_at_ms = now + ATTEMPT_INTERVAL_MS;
 			this->retry_active = true;
-			SetStatus("Waiting for the PS5 to finish the previous session");
-			CHIAKI_LOGI(this->log, "Console busy, retrying in %llu s",
-				(unsigned long long)(RETRY_DELAY_MS / 1000));
+			this->show_countdown = true;
+			SetStatus(reason == CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_IN_USE
+				? "PS5 is finishing the last session" : "PS5 isn't ready yet");
+			CHIAKI_LOGI(this->log, "Session refused (%s), retrying in %llu s",
+				chiaki_quit_reason_string(reason), (unsigned long long)(ATTEMPT_INTERVAL_MS / 1000));
 			return;
 		}
 		this->retry_active = false;
-		this->retry_deadline_ms = 0;
+		this->show_countdown = false;
 		CloseConnectingDialog([this, msg, cancelled]() {
 			if(!cancelled)
 				ShowError("Couldn't connect", msg);

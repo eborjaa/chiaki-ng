@@ -78,14 +78,19 @@ class HostInterface : public brls::List
 		// next Tick so the view stack is never changed twice in one tick
 		std::string pending_disconnect_msg;
 
-		// the PS5 keeps a dropped session for a few seconds, so an immediate
-		// reconnect is answered with "already in use"; retry instead of failing
+		// One Connect press keeps trying for CONNECT_WINDOW_MS before giving up:
+		// the home IP may have just changed (DDNS needs a minute to follow) or the
+		// PS5 still holds the previous session ("already in use"). Never started
+		// on its own after a drop: the user presses Connect/Reconnect.
+		static const uint64_t CONNECT_WINDOW_MS = 90000;
+		static const uint64_t ATTEMPT_INTERVAL_MS = 5000;
+		std::atomic<uint64_t> connect_deadline_ms{0};
+		std::atomic<bool> show_countdown{false};
 		bool retry_active = false;
 		uint64_t retry_at_ms = 0;
-		uint64_t retry_deadline_ms = 0;
-		static const uint64_t RETRY_DELAY_MS = 3000;
-		static const uint64_t RETRY_WINDOW_MS = 30000;
 		static bool RetryableQuit(ChiakiQuitReason reason);
+		bool SleepUnlessCancelled(uint64_t ms);
+		void StartPrep();
 
 		// stall watchdog: chiaki keeps a dead session alive after Wi-Fi loss
 		static const uint64_t STALL_TIMEOUT_MS = 5000;
